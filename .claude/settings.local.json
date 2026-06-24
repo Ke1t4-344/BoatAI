@@ -1,0 +1,9 @@
+{
+  "permissions": {
+    "allow": [
+      "Bash(/Users/miyoshikeita/miniconda3/envs/boatai/bin/python *)",
+      "Bash(git config *)",
+      "Bash(git *)"
+    ]
+  }
+}

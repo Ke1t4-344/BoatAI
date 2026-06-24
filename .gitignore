@@ -1,0 +1,6 @@
+boatai.db
+venv/
+__pycache__/
+*.pyc
+.env
+Miniconda3-latest-MacOSX-arm64.sh
