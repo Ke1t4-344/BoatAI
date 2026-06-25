@@ -4,3 +4,5 @@ __pycache__/
 *.pyc
 .env
 Miniconda3-latest-MacOSX-arm64.sh
+get-pip.py
+.claude/
