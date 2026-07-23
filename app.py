@@ -948,13 +948,15 @@ def get_venues(date):
     venue_races = {}
     for r in race_rows:
         venue_races.setdefault(r["venue_code"], []).append(r["id"])
-    all_ids = [r["id"] for r in race_rows]
-    ph = ",".join("?" * len(all_ids))
     with _conn() as c:
+        # IN句の代わりにJOINを使用（libsql-experimentalのパラメータ制限を回避）
         result_ids = {r[0] for r in c.execute(
-            f"SELECT DISTINCT race_id FROM race_result_entries WHERE race_id IN ({ph})", all_ids).fetchall()}
+            "SELECT DISTINCT rre.race_id FROM race_result_entries rre "
+            "JOIN races r ON r.id = rre.race_id WHERE r.date=?", (date,)).fetchall()}
         bi_ids = {r[0] for r in c.execute(
-            f"SELECT DISTINCT race_id FROM before_info WHERE exhibition_time IS NOT NULL AND race_id IN ({ph})", all_ids).fetchall()}
+            "SELECT DISTINCT bi.race_id FROM before_info bi "
+            "JOIN races r ON r.id = bi.race_id "
+            "WHERE bi.exhibition_time IS NOT NULL AND r.date=?", (date,)).fetchall()}
         venue_map = {r[0]: r[1] for r in c.execute("SELECT venue_code, venue_name FROM venues").fetchall()}
         # 開催何日目を計算（今日から遡って連続している日数）
         meet_days = {}
@@ -993,16 +995,24 @@ def get_races(date, venue_code):
             (date, venue_code)).fetchall()
     if not races:
         return []
-    ids = [r["id"] for r in races]
-    ph = ",".join("?" * len(ids))
+    ids = {r["id"] for r in races}
     with _conn() as c:
+        # JOIN を使用（libsql-experimental の IN句パラメータ制限を回避）
         result_ids = {r[0] for r in c.execute(
-            f"SELECT DISTINCT race_id FROM race_result_entries WHERE race_id IN ({ph})", ids).fetchall()}
+            "SELECT DISTINCT rre.race_id FROM race_result_entries rre "
+            "JOIN races r ON r.id = rre.race_id WHERE r.date=? AND r.venue_code=?",
+            (date, venue_code)).fetchall()}
         bi_ids = {r[0] for r in c.execute(
-            f"SELECT DISTINCT race_id FROM before_info WHERE exhibition_time IS NOT NULL AND race_id IN ({ph})", ids).fetchall()}
+            "SELECT DISTINCT bi.race_id FROM before_info bi "
+            "JOIN races r ON r.id = bi.race_id "
+            "WHERE bi.exhibition_time IS NOT NULL AND r.date=? AND r.venue_code=?",
+            (date, venue_code)).fetchall()}
         # 3連単払戻金
         sanrentan_map = {r[0]: r[1] for r in c.execute(
-            f"SELECT race_id, payout FROM payouts WHERE bet_type='3連単' AND race_id IN ({ph})", ids).fetchall()}
+            "SELECT p.race_id, p.payout FROM payouts p "
+            "JOIN races r ON r.id = p.race_id "
+            "WHERE p.bet_type='3連単' AND r.date=? AND r.venue_code=?",
+            (date, venue_code)).fetchall()}
     return [{"race_no": r["race_no"], "race_title": r["race_title"] or f"{r['race_no']}R",
              "scheduled_time": r["scheduled_time"],
              "has_result": r["id"] in result_ids, "has_bi": r["id"] in bi_ids,
@@ -1741,17 +1751,18 @@ def get_payout_summary(date):
         """, (date,)).fetchall()
         if not races:
             return {}
-        race_ids = [r["id"] for r in races]
-        ph = ",".join("?" * len(race_ids))
+        # JOIN を使用（libsql-experimental の IN句パラメータ制限を回避）
         payouts_raw = c.execute(
-            f"SELECT race_id, combination, payout FROM payouts "
-            f"WHERE bet_type='3連単' AND race_id IN ({ph})", race_ids
+            "SELECT p.race_id, p.combination, p.payout FROM payouts p "
+            "JOIN races r ON r.id = p.race_id "
+            "WHERE p.bet_type='3連単' AND r.date=?", (date,)
         ).fetchall()
         payout_map = {r["race_id"]: {"combination": r["combination"], "payout": r["payout"]}
                       for r in payouts_raw}
         results_raw = c.execute(
-            f"SELECT race_id, boat_no, rank FROM race_result_entries "
-            f"WHERE rank <= 3 AND race_id IN ({ph}) ORDER BY race_id, rank", race_ids
+            "SELECT rre.race_id, rre.boat_no, rre.rank FROM race_result_entries rre "
+            "JOIN races r ON r.id = rre.race_id "
+            "WHERE rre.rank <= 3 AND r.date=? ORDER BY rre.race_id, rre.rank", (date,)
         ).fetchall()
         results_map = {}
         for r in results_raw:

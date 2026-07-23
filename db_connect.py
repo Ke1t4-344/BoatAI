@@ -141,7 +141,11 @@ class _TursoConn:
         self._use_dict_row = (value is not None)
 
     def execute(self, sql, params=()):
-        cursor = self._conn.execute(sql, params) if params else self._conn.execute(sql)
+        # libsql_experimental はリスト不可・タプル必須なので変換
+        if params:
+            cursor = self._conn.execute(sql, tuple(params))
+        else:
+            cursor = self._conn.execute(sql)
         return _TursoCursor(cursor, self._use_dict_row)
 
     def executemany(self, sql, seq):
