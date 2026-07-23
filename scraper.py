@@ -12,22 +12,26 @@ boatrace.jp スクレイパー
   - 今節成績
 """
 
+import os
 import re
 import sqlite3
 import time
+import threading
 import logging
-from datetime import date
+from concurrent.futures import ThreadPoolExecutor, as_completed
+from datetime import date, datetime
 from pathlib import Path
 
 import requests
 from bs4 import BeautifulSoup
+from db_lock import acquire_write_lock, release_write_lock
 
 # ── 設定 ──────────────────────────────────────────────
 BASE_URL  = "https://www.boatrace.jp/owpc/pc/race"
 DATA_URL  = "https://www.boatrace.jp/owpc/pc/data/racersearch"
 DB_PATH   = Path(__file__).parent / "boatai.db"
 TODAY     = date.today().strftime("%Y%m%d")
-REQ_DELAY = 1.2
+REQ_DELAY = 0.8
 
 logging.basicConfig(
     level=logging.INFO,
@@ -56,6 +60,12 @@ _ZEN_NUM = {"１":1,"２":2,"３":3,"４":4,"５":5,"６":6}
 
 
 # ── DB 初期化 ────────────────────────────────────────
+def _ensure_column(conn: sqlite3.Connection, table: str, col: str, col_type: str) -> None:
+    existing = {row[1] for row in conn.execute(f"PRAGMA table_info({table})").fetchall()}
+    if col not in existing:
+        conn.execute(f"ALTER TABLE {table} ADD COLUMN {col} {col_type}")
+
+
 def init_db(conn: sqlite3.Connection) -> None:
     conn.executescript("""
         CREATE TABLE IF NOT EXISTS venues (
@@ -120,6 +130,14 @@ def init_db(conn: sqlite3.Connection) -> None:
             win_rate_3rd REAL,
             avg_st       REAL,
             UNIQUE (player_no, fetched_date, course_no)
+        );
+
+        -- コース別成績フェッチ試行ログ（成功・失敗問わず記録）
+        CREATE TABLE IF NOT EXISTS course_stats_log (
+            player_no    TEXT NOT NULL,
+            fetched_date TEXT NOT NULL,
+            has_data     INTEGER NOT NULL DEFAULT 0,  -- 1=データあり 0=公式サイトにデータなし
+            PRIMARY KEY (player_no, fetched_date)
         );
 
         -- 直前情報（レースごと・艇ごと）
@@ -200,13 +218,116 @@ def init_db(conn: sqlite3.Connection) -> None:
             UNIQUE (date, venue_code, player_no),
             FOREIGN KEY (venue_code) REFERENCES venues(venue_code)
         );
+
+        -- 単勝オッズ
+        CREATE TABLE IF NOT EXISTS odds_tansho (
+            id      INTEGER PRIMARY KEY AUTOINCREMENT,
+            race_id INTEGER NOT NULL,
+            boat_no INTEGER NOT NULL,
+            odds    REAL,
+            UNIQUE (race_id, boat_no),
+            FOREIGN KEY (race_id) REFERENCES races(id)
+        );
+
+        -- 2連単オッズ
+        CREATE TABLE IF NOT EXISTS odds_2t (
+            id          INTEGER PRIMARY KEY AUTOINCREMENT,
+            race_id     INTEGER NOT NULL,
+            combination TEXT    NOT NULL,
+            odds        REAL,
+            UNIQUE (race_id, combination),
+            FOREIGN KEY (race_id) REFERENCES races(id)
+        );
+
+        -- 選手ST履歴（STばらつき計算用）
+        CREATE TABLE IF NOT EXISTS st_history (
+            id           INTEGER PRIMARY KEY AUTOINCREMENT,
+            player_no    TEXT    NOT NULL,
+            race_id      INTEGER NOT NULL,
+            race_date    TEXT    NOT NULL,
+            venue_code   TEXT,
+            race_no      INTEGER,
+            start_course INTEGER,
+            start_timing TEXT,
+            finish_rank  INTEGER,
+            UNIQUE (player_no, race_id),
+            FOREIGN KEY (race_id) REFERENCES races(id)
+        );
+        CREATE TABLE IF NOT EXISTS predictions (
+            id            INTEGER PRIMARY KEY AUTOINCREMENT,
+            race_id       INTEGER NOT NULL UNIQUE,
+            predicted_at  TEXT    NOT NULL,
+            top5_combos   TEXT    NOT NULL,
+            actual_combo  TEXT,
+            hit_top3      INTEGER,
+            hit_top5      INTEGER,
+            top5_honmei   TEXT,
+            top5_chuana   TEXT,
+            top5_ana      TEXT,
+            hit_honmei    INTEGER,
+            hit_chuana    INTEGER,
+            hit_ana       INTEGER,
+            hit_honmei_5  INTEGER,
+            hit_chuana_10 INTEGER,
+            hit_ana_10    INTEGER,
+            FOREIGN KEY (race_id) REFERENCES races(id)
+        );
     """)
+
+    # entries テーブルの新カラムを追加（既存DBへの後付け対応）
+    _ensure_column(conn, "entries", "branch",               "TEXT")
+    _ensure_column(conn, "entries", "national_3ring_rate",  "REAL")
+    _ensure_column(conn, "entries", "nige_rate",            "REAL")
+    _ensure_column(conn, "entries", "sashi_rate",           "REAL")
+    _ensure_column(conn, "entries", "makuri_rate",          "REAL")
+    _ensure_column(conn, "entries", "makuri_sashi_rate",    "REAL")
+    _ensure_column(conn, "entries", "teiko_rate",           "REAL")
+    _ensure_column(conn, "entries", "megumi_rate",          "REAL")
+
+    # before_info の追加カラム（展示周回・直線タイム）
+    _ensure_column(conn, "before_info", "lap_time",      "REAL")
+    _ensure_column(conn, "before_info", "straight_time", "REAL")
+
+    # predictions の絞り込み用hit列（Top5/Top10）
+    _ensure_column(conn, "predictions", "hit_honmei_5",  "INTEGER")
+    _ensure_column(conn, "predictions", "hit_chuana_10", "INTEGER")
+    _ensure_column(conn, "predictions", "hit_ana_10",    "INTEGER")
+
     conn.commit()
 
+
+# コース別成績の並列フェッチ数（boatrace.jpへの同時接続数を抑制）
+COURSE_MAX_WORKERS = 5
+MAX_RACE_WORKERS   = 8
 
 # ── HTTP ユーティリティ ──────────────────────────────
 _session = requests.Session()
 _session.headers.update(HEADERS)
+
+# スレッドローカルセッション（コース別成績の並列フェッチ用）
+_tl = threading.local()
+
+
+def _get_tl_session() -> requests.Session:
+    """スレッドローカルなHTTPセッションを返す（並列フェッチ用）"""
+    if not hasattr(_tl, "session"):
+        s = requests.Session()
+        s.headers.update(HEADERS)
+        _tl.session = s
+    return _tl.session
+
+
+def _tl_fetch(url: str, params: dict | None = None) -> BeautifulSoup | None:
+    """スレッドセーフなfetch（スレッドローカルセッション使用）"""
+    try:
+        resp = _get_tl_session().get(url, params=params, timeout=15)
+        resp.raise_for_status()
+        resp.encoding = "utf-8"
+        time.sleep(REQ_DELAY)
+        return BeautifulSoup(resp.text, "html.parser")
+    except requests.RequestException as e:
+        log.warning("取得失敗 %s %s: %s", url, params, e)
+        return None
 
 
 def fetch(url: str, params: dict | None = None) -> BeautifulSoup | None:
@@ -522,9 +643,8 @@ def parse_before_info(soup: BeautifulSoup) -> tuple[list[dict], dict]:
                     weight = float(m.group(1))
                     break
 
-            # 展示タイム・チルト（rowspan=4 の数値セル）
-            # is-boatColor / img / is-fBold / labelGroup のセルを除外して判定
-            exhibition_time = tilt = None
+            # 展示タイム・チルト・周回タイム・直線タイム（rowspan=4 の数値セル順に取得）
+            exhibition_time = tilt = lap_time = straight_time = None
             for td in first_tds:
                 if td.get("rowspan") != "4":
                     continue
@@ -537,9 +657,13 @@ def parse_before_info(soup: BeautifulSoup) -> tuple[list[dict], dict]:
                 if f is None:
                     continue
                 if f > 5 and exhibition_time is None:
-                    exhibition_time = f
+                    exhibition_time = f      # 展示タイム (e.g. 6.78)
                 elif exhibition_time is not None and tilt is None:
-                    tilt = f
+                    tilt = f                 # チルト角度 (e.g. 0.0)
+                elif tilt is not None and lap_time is None:
+                    lap_time = f             # 周回タイム / まわり足
+                elif lap_time is not None and straight_time is None:
+                    straight_time = f        # 直線タイム
 
             # 前走成績（全行を走査してラベルで取得）
             prev_race_no = prev_course = prev_st = prev_finish = None
@@ -573,6 +697,8 @@ def parse_before_info(soup: BeautifulSoup) -> tuple[list[dict], dict]:
                     "weight":            weight,
                     "exhibition_time":   exhibition_time,
                     "tilt":              tilt,
+                    "lap_time":          lap_time,
+                    "straight_time":     straight_time,
                     "exhibit_course":    None,
                     "exhibit_st":        None,
                     "prev_race_venue":   prev_race_venue,
@@ -788,12 +914,13 @@ def upsert_venue(conn, code):
     )
 
 
-def upsert_race(conn, venue_code, race_no) -> int:
+def upsert_race(conn, venue_code, race_no, scheduled_time: str | None = None) -> int:
     conn.execute("""
-        INSERT INTO races (date, venue_code, race_no, race_title)
-        VALUES (?,?,?,?)
-        ON CONFLICT(date, venue_code, race_no) DO NOTHING
-    """, (TODAY, venue_code, race_no, f"{race_no}R"))
+        INSERT INTO races (date, venue_code, race_no, race_title, scheduled_time)
+        VALUES (?,?,?,?,?)
+        ON CONFLICT(date, venue_code, race_no) DO UPDATE SET
+            scheduled_time = COALESCE(excluded.scheduled_time, scheduled_time)
+    """, (TODAY, venue_code, race_no, f"{race_no}R", scheduled_time))
     row = conn.execute(
         "SELECT id FROM races WHERE date=? AND venue_code=? AND race_no=?",
         (TODAY, venue_code, race_no),
@@ -849,25 +976,124 @@ def save_course_stats(conn, player_no, stats):
               s["win_rate_1st"], s["win_rate_2nd"], s["win_rate_3rd"], s["avg_st"]))
 
 
+def save_course_stats_log(conn, player_no: str, has_data: bool) -> None:
+    """course_stats フェッチ試行を記録（成功・失敗問わず）"""
+    conn.execute("""
+        INSERT OR REPLACE INTO course_stats_log (player_no, fetched_date, has_data)
+        VALUES (?, ?, ?)
+    """, (player_no, TODAY, 1 if has_data else 0))
+
+
 def save_before_info(conn, race_id, entries):
     for e in entries:
         conn.execute("""
             INSERT INTO before_info
-              (race_id,boat_no,weight,exhibition_time,tilt,exhibit_course,exhibit_st,
+              (race_id,boat_no,weight,exhibition_time,tilt,lap_time,straight_time,
+               exhibit_course,exhibit_st,
                prev_race_venue,prev_race_date,prev_race_no,prev_entry_course,
                prev_start_timing,prev_finish)
-            VALUES (?,?,?,?,?,?,?,?,?,?,?,?,?)
+            VALUES (?,?,?,?,?,?,?,?,?,?,?,?,?,?,?)
             ON CONFLICT(race_id,boat_no) DO UPDATE SET
               weight=excluded.weight, exhibition_time=excluded.exhibition_time,
-              tilt=excluded.tilt, exhibit_course=excluded.exhibit_course,
+              tilt=excluded.tilt, lap_time=excluded.lap_time,
+              straight_time=excluded.straight_time,
+              exhibit_course=excluded.exhibit_course,
               exhibit_st=excluded.exhibit_st, prev_race_venue=excluded.prev_race_venue,
               prev_race_date=excluded.prev_race_date, prev_race_no=excluded.prev_race_no,
               prev_entry_course=excluded.prev_entry_course,
               prev_start_timing=excluded.prev_start_timing, prev_finish=excluded.prev_finish
         """, (race_id, e["boat_no"], e["weight"], e["exhibition_time"], e["tilt"],
+              e.get("lap_time"), e.get("straight_time"),
               e["exhibit_course"], e["exhibit_st"], e["prev_race_venue"],
               e["prev_race_date"], e["prev_race_no"], e["prev_entry_course"],
               e["prev_start_timing"], e["prev_finish"]))
+
+
+def _save_live_prediction(conn, race_id: int, vcode: str, rno: int) -> None:
+    """XGBoost予想を実行して predictions テーブルに保存（upsert）。"""
+    import json as _json
+    try:
+        from ml_predict import predict_ml
+        result = predict_ml(TODAY, vcode, rno, conn=conn)
+    except Exception as e:
+        log.warning("    ML予想スキップ (%s-%sR): %s", vcode, rno, e)
+        # フォールバック: ルールベース
+        try:
+            from predict import predict as _predict
+            result = _predict(TODAY, vcode, rno)
+        except Exception as e2:
+            log.warning("    ルールベース予想もスキップ: %s", e2)
+            return
+
+    top5        = [d["combo"] for d in result.get("recommended_3t_detail", [])[:5]]
+    honmei_list = [d["combo"] for d in result.get("honmei_detail", [])]
+    chuana_list = [d["combo"] for d in result.get("chuana_detail", [])]
+    ana_list    = [d["combo"] for d in result.get("ana_detail", [])]
+    now         = datetime.now().strftime("%Y-%m-%d %H:%M:%S")
+
+    conn.execute("""
+        INSERT INTO predictions
+          (race_id, predicted_at, top5_combos, top5_honmei, top5_chuana, top5_ana)
+        VALUES (?, ?, ?, ?, ?, ?)
+        ON CONFLICT(race_id) DO UPDATE SET
+            predicted_at = excluded.predicted_at,
+            top5_combos  = excluded.top5_combos,
+            top5_honmei  = excluded.top5_honmei,
+            top5_chuana  = excluded.top5_chuana,
+            top5_ana     = excluded.top5_ana
+    """, (race_id, now,
+          _json.dumps(top5, ensure_ascii=False),
+          _json.dumps(honmei_list, ensure_ascii=False),
+          _json.dumps(chuana_list, ensure_ascii=False),
+          _json.dumps(ana_list, ensure_ascii=False)))
+    log.info("    予想保存: Top5=%s", top5[:3])
+
+
+def _update_prediction_result(conn, race_id: int) -> None:
+    """確定結果保存後に actual_combo と hit フィールドを更新する。"""
+    import json as _json
+
+    # predictionsレコードが存在しない場合はスキップ
+    pred = conn.execute(
+        "SELECT top5_combos, top5_honmei, top5_chuana, top5_ana FROM predictions WHERE race_id=?",
+        (race_id,)
+    ).fetchone()
+    if not pred:
+        return
+
+    # 実際の3連単を取得
+    rows = conn.execute("""
+        SELECT rank, boat_no FROM race_result_entries
+        WHERE race_id=? AND rank IN (1,2,3) AND boat_no IS NOT NULL ORDER BY rank
+    """, (race_id,)).fetchall()
+    if len(rows) < 3:
+        return
+    rank_map = {r[0]: r[1] for r in rows}
+    actual = f"{rank_map[1]}-{rank_map[2]}-{rank_map[3]}"
+
+    def _hit(json_str, n=None):
+        if not json_str:
+            return None
+        combos = _json.loads(json_str)
+        if n is not None:
+            combos = combos[:n]
+        return 1 if actual in combos else 0
+
+    top5    = _json.loads(pred[0]) if pred[0] else []
+    hit_t3  = 1 if actual in top5[:3] else 0
+    hit_t5  = 1 if actual in top5     else 0
+
+    conn.execute("""
+        UPDATE predictions
+           SET actual_combo=?, hit_top3=?, hit_top5=?,
+               hit_honmei=?, hit_chuana=?, hit_ana=?,
+               hit_honmei_5=?, hit_chuana_10=?, hit_ana_10=?
+         WHERE race_id=?
+    """, (actual, hit_t3, hit_t5,
+          _hit(pred[1]),     _hit(pred[2]),     _hit(pred[3]),
+          _hit(pred[1], 5),  _hit(pred[2], 10), _hit(pred[3], 10),
+          race_id))
+    log.info("    的中判定: actual=%s hit_top3=%d hit_top5=%d", actual, hit_t3, hit_t5)
 
 
 def save_weather(conn, race_id, w):
@@ -928,6 +1154,237 @@ def save_meet_standings(conn, venue_code, standings):
 
 
 # ────────────────────────────────────────────────────
+# 新規パーサー 5: 単勝オッズ (oddstkf)
+# ────────────────────────────────────────────────────
+
+def parse_odds_tansho(soup: BeautifulSoup) -> dict[int, float | None]:
+    """単勝オッズ: boat_no → odds"""
+    result: dict[int, float | None] = {}
+    for table in soup.find_all("table"):
+        for tr in table.find_all("tr"):
+            tds = tr.find_all("td")
+            if not tds:
+                continue
+            # boat color class から艇番特定
+            boat_no = None
+            for td in tds:
+                classes = " ".join(td.get("class", []))
+                m = re.search(r"is-boatColor(\d)", classes)
+                if m:
+                    boat_no = int(m.group(1))
+                    break
+            if boat_no is None:
+                # 艇番が数字セルとして格納されているケース
+                txt = tds[0].get_text(strip=True)
+                if txt.isdigit() and 1 <= int(txt) <= 6:
+                    boat_no = int(txt)
+            if boat_no is None:
+                continue
+            # 数値セルからオッズを取得（最初の小数が単勝オッズ）
+            for td in tds[1:]:
+                val = _float(td.get_text(strip=True).replace(",", ""))
+                if val is not None:
+                    result[boat_no] = val
+                    break
+    return result
+
+
+# ────────────────────────────────────────────────────
+# 新規パーサー 6: 2連単オッズ (odds2tf)
+# ────────────────────────────────────────────────────
+
+def parse_odds_2t(soup: BeautifulSoup) -> dict[str, float | None]:
+    """2連単オッズ: 'a-b' → odds"""
+    tables = soup.find_all("table")
+    if len(tables) < 2:
+        return {}
+
+    # 3連単と同様のテーブル構造: 1着艇がヘッダ、2着艇が行
+    table = tables[1]
+    thead = table.find("thead")
+    if not thead:
+        return {}
+
+    first_boats: list[int] = []
+    for th in thead.find_all("th"):
+        classes = " ".join(th.get("class", []))
+        m = re.search(r"is-boatColor(\d)", classes)
+        if m and "borderLeftNone" not in classes:
+            first_boats.append(int(m.group(1)))
+
+    if not first_boats:
+        return {}
+
+    combo_map: dict[str, float | None] = {}
+    for tr in table.find_all("tr"):
+        tds = tr.find_all("td")
+        if not tds:
+            continue
+        cell_idx = 0
+        for grp, first in enumerate(first_boats):
+            if cell_idx >= len(tds):
+                break
+            second_no = _int(tds[cell_idx].get_text(strip=True))
+            if second_no is None or cell_idx + 1 >= len(tds):
+                cell_idx += 1
+                continue
+            odds_val = _float(tds[cell_idx + 1].get_text(strip=True))
+            cell_idx += 2
+            if second_no and first != second_no:
+                combo_map[f"{first}-{second_no}"] = odds_val
+
+    return combo_map
+
+
+# ────────────────────────────────────────────────────
+# 新規パーサー 7: 選手シーズン成績（決まり手率・3連対率・支部）
+# ────────────────────────────────────────────────────
+
+def parse_player_season(soup: BeautifulSoup) -> dict:
+    """
+    /data/racersearch/season?toban=XXXX から
+    branch, national_3ring_rate, 決まり手各率 を取得
+    """
+    result: dict = {
+        "branch": None,
+        "national_3ring_rate": None,
+        "nige_rate": None,
+        "sashi_rate": None,
+        "makuri_rate": None,
+        "makuri_sashi_rate": None,
+        "teiko_rate": None,
+        "megumi_rate": None,
+    }
+
+    # 支部: テキスト「支部」の近くにあるセル
+    for tr in soup.find_all("tr"):
+        tds = tr.find_all("td")
+        ths = tr.find_all("th")
+        row_text = tr.get_text()
+        if "支部" in row_text:
+            # th=支部ラベル, td=支部名
+            for td in tds:
+                t = td.get_text(strip=True)
+                if t and "支部" not in t and len(t) <= 8:
+                    result["branch"] = t
+                    break
+
+    # 3連対率: ページに「3連対率」というラベルがある箇所
+    all_text = soup.get_text()
+    m = re.search(r"3連対率[\s\S]*?(\d+\.\d+)", all_text[:3000])
+    if m:
+        result["national_3ring_rate"] = float(m.group(1))
+
+    # 決まり手: 「逃げ」「差し」「まくり」「まくり差し」「抵抗」「恵まれ」の順で出現するパターン
+    TRICKS = [
+        ("nige_rate",        "逃げ"),
+        ("sashi_rate",       "差し"),
+        ("makuri_rate",      "まくり"),
+        ("makuri_sashi_rate","まくり差し"),
+        ("teiko_rate",       "抵抗"),
+        ("megumi_rate",      "恵まれ"),
+    ]
+    for key, label in TRICKS:
+        idx = all_text.find(label)
+        if idx >= 0:
+            # ラベルの直後100文字以内で最初の数値(小数も可)を取得
+            snippet = all_text[idx: idx + 80]
+            m2 = re.search(r"(\d+\.?\d*)\s*%?", snippet[len(label):])
+            if m2:
+                result[key] = float(m2.group(1))
+
+    return result
+
+
+# ────────────────────────────────────────────────────
+# 新規保存: 単勝・2連単オッズ
+# ────────────────────────────────────────────────────
+
+def save_odds_tansho(conn, race_id: int, tansho_map: dict[int, float | None]) -> None:
+    for boat_no, odds_val in tansho_map.items():
+        conn.execute("""
+            INSERT INTO odds_tansho (race_id, boat_no, odds) VALUES (?,?,?)
+            ON CONFLICT(race_id, boat_no) DO UPDATE SET odds=excluded.odds
+        """, (race_id, boat_no, odds_val))
+
+
+def save_odds_2t(conn, race_id: int, combo_map: dict[str, float | None]) -> None:
+    for combo, odds_val in combo_map.items():
+        conn.execute("""
+            INSERT INTO odds_2t (race_id, combination, odds) VALUES (?,?,?)
+            ON CONFLICT(race_id, combination) DO UPDATE SET odds=excluded.odds
+        """, (race_id, combo, odds_val))
+
+
+def calc_trick_rates_from_db(conn, player_no: str) -> dict:
+    """
+    race_result_entries の winning_trick 実績から決まり手率を計算する。
+    boatrace.jp の選手検索ページには決まり手率データが存在しないため、
+    DB に蓄積した確定結果データを使って算出する。
+    「抜き」は「逃げ」に近い動きなので nige_rate に合算する。
+    """
+    rows = conn.execute("""
+        SELECT winning_trick, COUNT(*) cnt
+        FROM race_result_entries
+        WHERE player_no=? AND rank=1
+        GROUP BY winning_trick
+    """, (player_no,)).fetchall()
+
+    total = sum(r[1] for r in rows)
+    if total == 0:
+        return {}
+
+    trick_map = {r[0]: r[1] for r in rows}
+    nige  = trick_map.get("逃げ", 0) + trick_map.get("抜き", 0)
+    return {
+        "nige_rate":         round(nige                          / total * 100, 1),
+        "sashi_rate":        round(trick_map.get("差し", 0)      / total * 100, 1),
+        "makuri_rate":       round(trick_map.get("まくり", 0)    / total * 100, 1),
+        "makuri_sashi_rate": round(trick_map.get("まくり差し", 0)/ total * 100, 1),
+        "teiko_rate":        round(trick_map.get("抵抗", 0)      / total * 100, 1),
+        "megumi_rate":       round(trick_map.get("恵まれ", 0)    / total * 100, 1),
+    }
+
+
+def save_player_season(conn, race_id: int, player_no: str, data: dict) -> None:
+    """決まり手率・支部・3連対率を entries テーブルに更新"""
+    conn.execute("""
+        UPDATE entries SET
+          branch=?, national_3ring_rate=?,
+          nige_rate=?, sashi_rate=?, makuri_rate=?,
+          makuri_sashi_rate=?, teiko_rate=?, megumi_rate=?
+        WHERE race_id=? AND player_no=?
+    """, (
+        data.get("branch"), data.get("national_3ring_rate"),
+        data.get("nige_rate"), data.get("sashi_rate"), data.get("makuri_rate"),
+        data.get("makuri_sashi_rate"), data.get("teiko_rate"), data.get("megumi_rate"),
+        race_id, player_no,
+    ))
+
+
+def save_st_history_from_result(
+    conn, race_id: int, race_date: str, venue_code: str, race_no: int,
+    result_entries: list[dict]
+) -> None:
+    """確定結果からST履歴を保存"""
+    for e in result_entries:
+        if not e.get("player_no"):
+            continue
+        conn.execute("""
+            INSERT INTO st_history
+              (player_no, race_id, race_date, venue_code, race_no,
+               start_course, start_timing, finish_rank)
+            VALUES (?,?,?,?,?,?,?,?)
+            ON CONFLICT(player_no, race_id) DO UPDATE SET
+              start_timing=excluded.start_timing,
+              finish_rank=excluded.finish_rank
+        """, (
+            e["player_no"], race_id, race_date, venue_code, race_no,
+            e.get("start_course"), e.get("start_timing"), e.get("rank"),
+        ))
+
+
+# ────────────────────────────────────────────────────
 # 開催一覧・レース数取得
 # ────────────────────────────────────────────────────
 
@@ -946,27 +1403,83 @@ def fetch_today_venues() -> list[str]:
     return venues
 
 
-def fetch_max_race_no(venue_code: str) -> int:
+def fetch_race_schedule(venue_code: str) -> tuple[int, dict[int, str]]:
+    """
+    raceindex ページからレース数とレース別開始時刻を取得する。
+    Returns: (max_race_no, {race_no: "HH:MM"})
+    """
     soup = fetch(f"{BASE_URL}/raceindex", params={"jcd": venue_code, "hd": TODAY})
     if soup is None:
-        return 12
+        return 12, {}
+
     race_nos: set[int] = set()
+    schedule: dict[int, str] = {}
+
+    # raceindex の各行: <a href="...rno=N...">NR</a> の近くに時刻テキストがある
     for a in soup.find_all("a", href=re.compile(r"rno=\d+")):
         m = re.search(r"rno=(\d+)", a["href"])
-        if m:
-            race_nos.add(int(m.group(1)))
-    return max(race_nos) if race_nos else 12
+        if not m:
+            continue
+        rno = int(m.group(1))
+        race_nos.add(rno)
+
+        # 親セル or 親行から時刻を探す（HH:MM 形式）
+        cell = a.find_parent("td") or a.find_parent("li") or a.find_parent("div")
+        if cell:
+            row = cell.find_parent("tr") or cell.find_parent("ul") or cell.parent
+            text = row.get_text(" ", strip=True) if row else cell.get_text(" ", strip=True)
+            tm = re.search(r"\b(\d{1,2}:\d{2})\b", text)
+            if tm:
+                schedule[rno] = tm.group(1)
+
+    max_rno = max(race_nos) if race_nos else 12
+    return max_rno, schedule
+
+
+def fetch_max_race_no(venue_code: str) -> int:
+    max_rno, _ = fetch_race_schedule(venue_code)
+    return max_rno
 
 
 # ────────────────────────────────────────────────────
 # メイン処理
 # ────────────────────────────────────────────────────
 
-def main() -> None:
+def main(force: bool = False) -> None:
+    # ── 多重起動防止（PIDファイルロック）──────────────────
+    PID_FILE = Path(__file__).parent / ".scraper_running.pid"
+    if PID_FILE.exists():
+        try:
+            old_pid = int(PID_FILE.read_text().strip())
+            os.kill(old_pid, 0)   # プロセスが存在するか確認
+            log.warning("別インスタンスが実行中 (PID=%d)。二重起動を防止して終了します。", old_pid)
+            return
+        except (ProcessLookupError, PermissionError):
+            pass   # 古いPIDファイルが残っているだけ → 上書きして続行
+    PID_FILE.write_text(str(os.getpid()))
+    try:
+        acquire_write_lock(wait=True, timeout=600)
+        try:
+            _main_body(force=force)
+        finally:
+            release_write_lock()
+    finally:
+        PID_FILE.unlink(missing_ok=True)
+
+
+def _main_body(force: bool = False) -> None:
+    # 23:30〜07:30 は historical_scraper と競合するため実行しない
+    # --force オプション指定時はこの制限をスキップ（手動補完用）
+    now = datetime.now()
+    now_minutes = now.hour * 60 + now.minute
+    if not force and not (7 * 60 + 30 <= now_minutes < 23 * 60 + 30):
+        log.info("23:30〜07:30 は historical_scraper 専用時間帯のため終了します (time=%02d:%02d)", now.hour, now.minute)
+        return
+
     log.info("=== boatrace.jp スクレイパー 開始 (日付: %s) ===", TODAY)
 
-    conn = sqlite3.connect(DB_PATH)
-    conn.execute("PRAGMA journal_mode=WAL")
+    from db_connect import open_db
+    conn = open_db()
     init_db(conn)
 
     venue_codes = fetch_today_venues()
@@ -981,7 +1494,7 @@ def main() -> None:
         upsert_venue(conn, vcode)
         conn.commit()
 
-        max_rno = fetch_max_race_no(vcode)
+        max_rno, schedule = fetch_race_schedule(vcode)
         log.info("  レース数: %d", max_rno)
 
         # 今節成績
@@ -992,74 +1505,276 @@ def main() -> None:
             conn.commit()
             log.info("  今節成績: %d名", len(standings))
 
-        # レースごとのデータ取得
+        # ── レースごとのデータ取得（3フェーズ並列版）────────────────
+        # Phase 1: 全レースのDB状態確認（ロック保持中・高速）
+        # Phase 2: 全レースを並列HTTPフェッチ（ロック解放中）
+        # Phase 3: DB一括書き込み（ロック再取得）
         collected_player_nos: set[str] = set()
 
+        # ── Phase 1: DB状態確認 ───────────────────────────────────────
+        race_states: list[dict] = []
         for rno in range(1, max_rno + 1):
-            race_id = upsert_race(conn, vcode, rno)
+            race_id = upsert_race(conn, vcode, rno, schedule.get(rno))
             conn.commit()
+
+            has_result = conn.execute(
+                "SELECT COUNT(*) FROM race_result_entries WHERE race_id=?", (race_id,)
+            ).fetchone()[0]
+            if has_result > 0:
+                for row in conn.execute(
+                    "SELECT player_no FROM entries WHERE race_id=? AND player_no IS NOT NULL",
+                    (race_id,)
+                ).fetchall():
+                    collected_player_nos.add(row[0])
+                # actual_combo未更新の予測があれば的中判定を補完
+                needs_update = conn.execute(
+                    "SELECT COUNT(*) FROM predictions WHERE race_id=? AND actual_combo IS NULL",
+                    (race_id,)
+                ).fetchone()[0]
+                if needs_update > 0:
+                    _update_prediction_result(conn, race_id)
+                    conn.commit()
+                log.info("  ── %dR (race_id=%d) スキップ（確定結果取得済み）", rno, race_id)
+                race_states.append({"rno": rno, "race_id": race_id, "skip": True})
+                continue
+
+            has_entries = conn.execute(
+                "SELECT COUNT(*) FROM entries WHERE race_id=?", (race_id,)
+            ).fetchone()[0]
+            if has_entries > 0:
+                for row in conn.execute(
+                    "SELECT player_no FROM entries WHERE race_id=? AND player_no IS NOT NULL",
+                    (race_id,)
+                ).fetchall():
+                    collected_player_nos.add(row[0])
+            has_before = conn.execute(
+                "SELECT COUNT(*) FROM before_info WHERE race_id=?", (race_id,)
+            ).fetchone()[0]
+            race_states.append({
+                "rno": rno, "race_id": race_id, "skip": False,
+                "has_entries": has_entries, "has_before": has_before,
+            })
+
+        # ── Phase 2: 並列HTTPフェッチ（ロック解放中） ─────────────────
+        active_states = [s for s in race_states if not s["skip"]]
+        fetched_races: dict[int, dict] = {}
+
+        if active_states:
+            release_write_lock()
+
+            def _fetch_race_pages(state: dict) -> dict:
+                """1レース分の全ページを取得・パースして返す（スレッドセーフ）"""
+                rno         = state["rno"]
+                has_entries = state["has_entries"]
+                has_before  = state["has_before"]
+
+                soup_list   = _tl_fetch(f"{BASE_URL}/racelist",
+                                        params={"rno": rno, "jcd": vcode, "hd": TODAY}) \
+                              if has_entries == 0 else None
+                soup_odds   = _tl_fetch(f"{BASE_URL}/odds3t",
+                                        params={"rno": rno, "jcd": vcode, "hd": TODAY})
+                soup_tansho = _tl_fetch(f"{BASE_URL}/oddstkf",
+                                        params={"rno": rno, "jcd": vcode, "hd": TODAY})
+                soup_2t     = _tl_fetch(f"{BASE_URL}/odds2tf",
+                                        params={"rno": rno, "jcd": vcode, "hd": TODAY})
+                soup_before = _tl_fetch(f"{BASE_URL}/beforeinfo",
+                                        params={"rno": rno, "jcd": vcode, "hd": TODAY}) \
+                              if has_before == 0 else None
+                soup_result = _tl_fetch(f"{BASE_URL}/raceresult",
+                                        params={"rno": rno, "jcd": vcode, "hd": TODAY})
+
+                return {
+                    "rno":         rno,
+                    "race_id":     state["race_id"],
+                    "has_entries": has_entries,
+                    "has_before":  has_before,
+                    "entries":     parse_entries(soup_list)       if soup_list   else [],
+                    "combo_map":   parse_odds_3t(soup_odds)       if soup_odds   else {},
+                    "tansho_map":  parse_odds_tansho(soup_tansho) if soup_tansho else {},
+                    "combo_2t":    parse_odds_2t(soup_2t)         if soup_2t     else {},
+                    "bi_weather":  parse_before_info(soup_before) if soup_before else ([], {}),
+                    "result":      parse_race_result(soup_result) if soup_result else ([], []),
+                }
+
+            with ThreadPoolExecutor(max_workers=MAX_RACE_WORKERS) as pool:
+                futures = {
+                    pool.submit(_fetch_race_pages, s): s["rno"]
+                    for s in active_states
+                }
+                for future in as_completed(futures):
+                    rno = futures[future]
+                    try:
+                        fetched_races[rno] = future.result()
+                    except Exception as e:
+                        log.warning("  %dR: フェッチ失敗 %s", rno, e)
+
+            # ── Phase 3: DB一括書き込み（ロック再取得） ─────────────────
+            acquire_write_lock(wait=True, timeout=60)
+
+        for state in active_states:
+            rno     = state["rno"]
+            race_id = state["race_id"]
+            data    = fetched_races.get(rno)
             log.info("  ── %dR (race_id=%d) ──", rno, race_id)
 
-            # 出走表
-            soup_list = fetch(f"{BASE_URL}/racelist",
-                              params={"rno": rno, "jcd": vcode, "hd": TODAY})
-            if soup_list:
-                entries = parse_entries(soup_list)
-                save_entries(conn, race_id, entries)
+            if not data:
+                log.warning("    フェッチデータなし（スキップ）")
+                continue
+
+            if data["entries"]:
+                save_entries(conn, race_id, data["entries"])
                 conn.commit()
-                for e in entries:
+                for e in data["entries"]:
                     if e["player_no"]:
                         collected_player_nos.add(e["player_no"])
-                log.info("    出走表: %d艇", len(entries))
+                log.info("    出走表: %d艇", len(data["entries"]))
+            elif data["has_entries"] > 0:
+                log.info("    出走表: スキップ（取得済み）")
 
-            # 3連単オッズ
-            soup_odds = fetch(f"{BASE_URL}/odds3t",
-                              params={"rno": rno, "jcd": vcode, "hd": TODAY})
-            if soup_odds:
-                combo_map = parse_odds_3t(soup_odds)
-                save_odds(conn, race_id, combo_map)
+            if data["combo_map"]:
+                save_odds(conn, race_id, data["combo_map"])
                 conn.commit()
-                log.info("    3連単オッズ: %d件", len(combo_map))
+                log.info("    3連単オッズ: %d件", len(data["combo_map"]))
 
-            # 直前情報 + 気象
-            soup_before = fetch(f"{BASE_URL}/beforeinfo",
-                                params={"rno": rno, "jcd": vcode, "hd": TODAY})
-            if soup_before:
-                bi_entries, weather = parse_before_info(soup_before)
+            if data["tansho_map"]:
+                save_odds_tansho(conn, race_id, data["tansho_map"])
+                conn.commit()
+                log.info("    単勝オッズ: %d件", len(data["tansho_map"]))
+
+            if data["combo_2t"]:
+                save_odds_2t(conn, race_id, data["combo_2t"])
+                conn.commit()
+                log.info("    2連単オッズ: %d件", len(data["combo_2t"]))
+
+            bi_entries, weather = data["bi_weather"]
+            if bi_entries:
                 save_before_info(conn, race_id, bi_entries)
                 save_weather(conn, race_id, weather)
                 conn.commit()
-                log.info("    直前情報: %d艇 / 気象: %s",
-                         len(bi_entries), bool(weather))
+                log.info("    直前情報: %d艇 / 気象: %s", len(bi_entries), bool(weather))
+                _save_live_prediction(conn, race_id, vcode, rno)
+                conn.commit()
+            elif data["has_before"] > 0:
+                log.info("    直前情報: スキップ（取得済み）")
+            else:
+                log.info("    直前情報: 0艇（展示前）")
 
-            # 確定結果
-            soup_result = fetch(f"{BASE_URL}/raceresult",
-                                params={"rno": rno, "jcd": vcode, "hd": TODAY})
-            if soup_result:
-                res_entries, payouts = parse_race_result(soup_result)
+            res_entries, payouts = data["result"]
+            if res_entries:
                 save_race_result_entries(conn, race_id, res_entries)
                 save_payouts(conn, race_id, payouts)
+                save_st_history_from_result(conn, race_id, TODAY, vcode, rno, res_entries)
                 conn.commit()
                 log.info("    確定結果: 着順%d件 / 払戻%d件",
                          len(res_entries), len(payouts))
-
-        # コース別成績（選手ごと・本日未取得分のみ）
-        already = {row[0] for row in
-                   conn.execute("SELECT player_no FROM course_stats WHERE fetched_date=?",
-                                (TODAY,)).fetchall()}
-        to_fetch = collected_player_nos - already
-        log.info("  コース別成績: %d名取得予定", len(to_fetch))
-
-        for player_no in sorted(to_fetch):
-            soup_cs = fetch(f"{DATA_URL}/course", params={"toban": player_no})
-            if soup_cs:
-                cs = parse_course_stats(soup_cs)
-                save_course_stats(conn, player_no, cs)
+                _update_prediction_result(conn, race_id)
                 conn.commit()
+            else:
+                log.info("    確定結果: 着順0件 / 払戻0件")
 
+        # コース別成績 + シーズン成績（選手ごと・本日未取得分のみ）
+        # already: 本日すでにフェッチ試行済みの選手（成功・失敗問わず）
+        # + 直近7日以内にデータなし判定された選手（クールダウン中）
+        already = {row[0] for row in conn.execute("""
+            SELECT player_no FROM course_stats WHERE fetched_date = ?
+            UNION
+            SELECT player_no FROM course_stats_log  WHERE fetched_date = ?
+            UNION
+            SELECT player_no FROM course_stats_log
+             WHERE has_data = 0
+               AND fetched_date >= date(?, '-7 days')
+               AND fetched_date < ?
+        """, (TODAY, TODAY, TODAY, TODAY)).fetchall()}
+        to_fetch = sorted(collected_player_nos - already)
+        log.info("  コース別成績・シーズン成績: %d名取得予定 (スキップ:%d名)",
+                 len(to_fetch), len(collected_player_nos) - len(to_fetch))
+
+        if to_fetch:
+            # ── HTTPフェッチ（ロック解放中・並列） ──────────────────────
+            # ロックを解放してfocused_scraperが割り込めるようにする（最大16分→3分に短縮）
+            release_write_lock()
+
+            def _fetch_player_stats(pno: str) -> dict:
+                """コース別成績 + シーズン成績をHTTP取得（スレッドセーフ）"""
+                result: dict = {"player_no": pno, "course": None, "season": None}
+                soup_cs = _tl_fetch(f"{DATA_URL}/course", params={"toban": pno})
+                if soup_cs:
+                    result["course"] = parse_course_stats(soup_cs)
+                soup_season = _tl_fetch(f"{DATA_URL}/season", params={"toban": pno})
+                if soup_season:
+                    result["season"] = parse_player_season(soup_season)
+                return result
+
+            fetched_player_data: dict[str, dict] = {}
+            with ThreadPoolExecutor(max_workers=COURSE_MAX_WORKERS) as pool:
+                futures = {pool.submit(_fetch_player_stats, pno): pno for pno in to_fetch}
+                done_count = 0
+                for future in as_completed(futures):
+                    pno = futures[future]
+                    try:
+                        fetched_player_data[pno] = future.result()
+                        done_count += 1
+                        if done_count % 10 == 0 or done_count == len(to_fetch):
+                            log.info("  コース別成績取得進捗: %d/%d名", done_count, len(to_fetch))
+                    except Exception as e:
+                        log.warning("  %s: フェッチ失敗 %s", pno, e)
+
+            # ── DB書き込み（ロック再取得） ────────────────────────────
+            acquire_write_lock(wait=True, timeout=120)
+
+            for player_no in to_fetch:
+                data = fetched_player_data.get(player_no)
+                if not data:
+                    continue
+
+                # コース別成績保存
+                cs = data.get("course")
+                if cs is not None:
+                    save_course_stats(conn, player_no, cs)
+                    save_course_stats_log(conn, player_no, bool(cs))
+                    if not cs:
+                        log.debug("  %s: コース別成績なし（公式サイトにデータなし）", player_no)
+                    conn.commit()
+
+                # シーズン成績保存
+                season_data = data.get("season")
+                if season_data is not None:
+                    # 決まり手率: DB実績から計算して上書き
+                    trick_rates = calc_trick_rates_from_db(conn, player_no)
+                    season_data.update(trick_rates)
+                    rows = conn.execute("""
+                        SELECT e.race_id FROM entries e
+                        JOIN races r ON r.id = e.race_id
+                        WHERE e.player_no=? AND r.date=?
+                    """, (player_no, TODAY)).fetchall()
+                    for (rid,) in rows:
+                        save_player_season(conn, rid, player_no, season_data)
+                    conn.commit()
+                    log.info("    %s: 決まり手率 逃げ=%.1f%% 差し=%.1f%% まくり=%.1f%% (DB実績%d件)",
+                             player_no,
+                             season_data.get("nige_rate") or 0,
+                             season_data.get("sashi_rate") or 0,
+                             season_data.get("makuri_rate") or 0,
+                             sum(1 for _ in conn.execute(
+                                 "SELECT 1 FROM race_result_entries WHERE player_no=? AND rank=1",
+                                 (player_no,)
+                             )))
+
+    # WALのパッシブチェックポイント（他プロセスをブロックしない安全な方式）
+    # 注意: TRUNCATE は他のバックアッププロセスのread snapshotを無効化しDB破損を招く可能性があるため使用禁止
+    # SQLiteの自動チェックポイント(1000ページ)に任せる方針。手動ではPASSIVEのみ許可。
+    try:
+        conn.execute("PRAGMA wal_checkpoint(PASSIVE)")
+    except Exception:
+        pass
     conn.close()
     log.info("=== 完了: %s に保存しました ===", DB_PATH)
 
 
 if __name__ == "__main__":
-    main()
+    import argparse
+    parser = argparse.ArgumentParser()
+    parser.add_argument("--force", action="store_true",
+                        help="時間制限(22:00〜08:00)を無視して強制実行（手動補完用）")
+    args = parser.parse_args()
+    main(force=args.force)

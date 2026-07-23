@@ -1,0 +1,15 @@
+{
+  "optimized_at": "2026-06-29T23:23:24",
+  "top_k": 3,
+  "n_races": 6586,
+  "baseline_hit_rate": 0.1862,
+  "best_hit_rate": 0.2062,
+  "weights": {
+    "course_win_rate": 0.5059,
+    "national_win_rate": 0.251,
+    "local_win_rate": 0.0515,
+    "motor_2ring": 0.0558,
+    "exhibition_time": 0.1358,
+    "start_timing": 0.0001
+  }
+}
