@@ -10,7 +10,10 @@ import streamlit as st
 import sqlite3
 import pandas as pd
 import plotly.graph_objects as go
-from datetime import datetime, timedelta
+from datetime import datetime, timedelta, timezone
+
+# Streamlit Cloud は UTC で動くため JST (+9) を明示
+_JST = timezone(timedelta(hours=9))
 from pathlib import Path
 import importlib
 import predict as _predict_module
@@ -906,29 +909,9 @@ def nav(page, **kw):
 
 
 # ─── DB helpers ───────────────────────────────────────────────────────────────
-class _ConnProxy:
-    """requests.Session を使い回すため、close() しない接続ラッパー。
-    Turso HTTP API は毎回新規セッションを作ると TLS ハンドシェイクが発生し低速になる。
-    st.session_state に保持することで、ユーザーセッション中は1回の TLS で済む。"""
-    __slots__ = ("_c",)
-    def __init__(self, conn):         self._c = conn
-    def __enter__(self):              return self
-    def __exit__(self, *_):           pass          # close しない
-    def execute(self, sql, params=()):return self._c.execute(sql, params)
-    def executemany(self, sql, seq):  return self._c.executemany(sql, seq)
-    def commit(self):                 return self._c.commit()
-    @property
-    def row_factory(self):            return self._c.row_factory
-    @row_factory.setter
-    def row_factory(self, v):         self._c.row_factory = v
-
-
 def _conn():
     from db_connect import open_db
-    _KEY = "_db_conn"
-    if _KEY not in st.session_state or st.session_state[_KEY] is None:
-        st.session_state[_KEY] = open_db(row_factory=sqlite3.Row)
-    return _ConnProxy(st.session_state[_KEY])
+    return open_db(row_factory=sqlite3.Row)
 
 
 @st.cache_data(ttl=120)
@@ -1943,7 +1926,7 @@ def show_home():
 
     elif _active_tab == "⏰ 締切順":
         dl_races = get_deadline_races(date)
-        now_dt   = datetime.now()
+        now_dt   = datetime.now(_JST)   # Streamlit Cloud はUTCのため JST を明示
         now_time = now_dt.strftime("%H:%M")
         now_5min = (now_dt + timedelta(minutes=5)).strftime("%H:%M")
 
