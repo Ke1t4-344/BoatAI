@@ -37,17 +37,34 @@ st.set_page_config(
 )
 
 # ─── パスワード認証 ────────────────────────────────────────────────────────────
+import hashlib, hmac as _hmac
+
+def _make_auth_token(pw: str) -> str:
+    """パスワードから決定論的なURLトークンを生成（クッキー代わり）"""
+    key = (pw + "_boatai_v1").encode()
+    return _hmac.new(key, pw.encode(), hashlib.sha256).hexdigest()[:32]
+
 def _check_auth():
     """
     AUTH_PASSWORD 環境変数が設定されていればログイン画面を表示。
-    未設定（ローカル開発）の場合はスキップして通常起動。
+    ログイン後はURLに ?t=トークン を付与し、次回アクセス時は自動認証。
+    （URLをブックマークすれば毎回パスワード入力不要）
     """
     import os
     _pw = os.environ.get("AUTH_PASSWORD", "")
     if not _pw:
         return  # 認証なし
+
+    expected = _make_auth_token(_pw)
+
+    # URLトークンチェック（リロード後も有効）
+    if st.query_params.get("t") == expected:
+        st.session_state["_authenticated"] = True
+        return
+
     if st.session_state.get("_authenticated"):
-        return  # 認証済み
+        return
+
     # ── ログイン画面 ──
     st.markdown("""
     <style>
@@ -65,6 +82,7 @@ def _check_auth():
             if ok:
                 if entered == _pw:
                     st.session_state["_authenticated"] = True
+                    st.query_params["t"] = expected  # URLにトークンを埋め込む
                     st.rerun()
                 else:
                     st.error("パスワードが違います")
