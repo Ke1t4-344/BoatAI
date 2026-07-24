@@ -3590,9 +3590,10 @@ def show_analysis():
     COURSE_COLORS_A = COURSE_COLORS  # 艇番カラーと統一
 
     with _conn() as conn_a:
-        venues_df = pd.read_sql_query(
-            "SELECT DISTINCT venue_code FROM races ORDER BY venue_code", conn_a
-        )
+        _vc_rows = conn_a.execute(
+            "SELECT DISTINCT venue_code FROM races ORDER BY venue_code"
+        ).fetchall()
+        venues_df = pd.DataFrame([{"venue_code": r[0]} for r in _vc_rows])
     venue_opts = ["全会場"] + [
         f"{c} {_analysis.venue_name(c)}" for c in venues_df["venue_code"]
     ]
