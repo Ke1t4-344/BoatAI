@@ -298,7 +298,7 @@ def init_db(conn: sqlite3.Connection) -> None:
 
 # コース別成績の並列フェッチ数（boatrace.jpへの同時接続数を抑制）
 COURSE_MAX_WORKERS = 5
-MAX_RACE_WORKERS   = 8
+MAX_RACE_WORKERS   = 12
 
 # ── HTTP ユーティリティ ──────────────────────────────
 _session = requests.Session()
@@ -929,51 +929,61 @@ def upsert_race(conn, venue_code, race_no, scheduled_time: str | None = None) ->
 
 
 def save_entries(conn, race_id, entries):
-    for e in entries:
-        conn.execute("""
-            INSERT INTO entries
-              (race_id,boat_no,player_no,player_name,player_class,age,weight,
-               flying_count,late_count,avg_start_timing,
-               national_win_rate,national_2ring_rate,local_win_rate,local_2ring_rate,
-               motor_no,motor_2ring_rate,boat_no_hull,boat_2ring_rate)
-            VALUES (?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?)
-            ON CONFLICT(race_id,boat_no) DO UPDATE SET
-              player_no=excluded.player_no, player_name=excluded.player_name,
-              player_class=excluded.player_class, age=excluded.age, weight=excluded.weight,
-              flying_count=excluded.flying_count, late_count=excluded.late_count,
-              avg_start_timing=excluded.avg_start_timing,
-              national_win_rate=excluded.national_win_rate,
-              national_2ring_rate=excluded.national_2ring_rate,
-              local_win_rate=excluded.local_win_rate, local_2ring_rate=excluded.local_2ring_rate,
-              motor_no=excluded.motor_no, motor_2ring_rate=excluded.motor_2ring_rate,
-              boat_no_hull=excluded.boat_no_hull, boat_2ring_rate=excluded.boat_2ring_rate
-        """, (race_id, e["boat_no"], e["player_no"], e["player_name"], e["player_class"],
-              e["age"], e["weight"], e["flying_count"], e["late_count"], e["avg_start_timing"],
-              e["national_win_rate"], e["national_2ring_rate"],
-              e["local_win_rate"], e["local_2ring_rate"],
-              e["motor_no"], e["motor_2ring_rate"], e["boat_no_hull"], e["boat_2ring_rate"]))
+    if not entries:
+        return
+    sql = """
+        INSERT INTO entries
+          (race_id,boat_no,player_no,player_name,player_class,age,weight,
+           flying_count,late_count,avg_start_timing,
+           national_win_rate,national_2ring_rate,local_win_rate,local_2ring_rate,
+           motor_no,motor_2ring_rate,boat_no_hull,boat_2ring_rate)
+        VALUES (?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?)
+        ON CONFLICT(race_id,boat_no) DO UPDATE SET
+          player_no=excluded.player_no, player_name=excluded.player_name,
+          player_class=excluded.player_class, age=excluded.age, weight=excluded.weight,
+          flying_count=excluded.flying_count, late_count=excluded.late_count,
+          avg_start_timing=excluded.avg_start_timing,
+          national_win_rate=excluded.national_win_rate,
+          national_2ring_rate=excluded.national_2ring_rate,
+          local_win_rate=excluded.local_win_rate, local_2ring_rate=excluded.local_2ring_rate,
+          motor_no=excluded.motor_no, motor_2ring_rate=excluded.motor_2ring_rate,
+          boat_no_hull=excluded.boat_no_hull, boat_2ring_rate=excluded.boat_2ring_rate
+    """
+    conn.executemany(sql, [
+        (race_id, e["boat_no"], e["player_no"], e["player_name"], e["player_class"],
+         e["age"], e["weight"], e["flying_count"], e["late_count"], e["avg_start_timing"],
+         e["national_win_rate"], e["national_2ring_rate"],
+         e["local_win_rate"], e["local_2ring_rate"],
+         e["motor_no"], e["motor_2ring_rate"], e["boat_no_hull"], e["boat_2ring_rate"])
+        for e in entries
+    ])
 
 
 def save_odds(conn, race_id, combo_map):
-    for combo, odds_val in combo_map.items():
-        conn.execute("""
-            INSERT INTO odds_3t (race_id, combination, odds) VALUES (?,?,?)
-            ON CONFLICT(race_id, combination) DO UPDATE SET odds=excluded.odds
-        """, (race_id, combo, odds_val))
+    if not combo_map:
+        return
+    conn.executemany(
+        "INSERT INTO odds_3t (race_id, combination, odds) VALUES (?,?,?)"
+        " ON CONFLICT(race_id, combination) DO UPDATE SET odds=excluded.odds",
+        [(race_id, combo, odds_val) for combo, odds_val in combo_map.items()]
+    )
 
 
 def save_course_stats(conn, player_no, stats):
-    for s in stats:
-        conn.execute("""
-            INSERT INTO course_stats
-              (player_no,fetched_date,course_no,entry_rate,win_rate_1st,win_rate_2nd,win_rate_3rd,avg_st)
-            VALUES (?,?,?,?,?,?,?,?)
-            ON CONFLICT(player_no,fetched_date,course_no) DO UPDATE SET
-              entry_rate=excluded.entry_rate, win_rate_1st=excluded.win_rate_1st,
-              win_rate_2nd=excluded.win_rate_2nd, win_rate_3rd=excluded.win_rate_3rd,
-              avg_st=excluded.avg_st
-        """, (player_no, TODAY, s["course_no"], s["entry_rate"],
-              s["win_rate_1st"], s["win_rate_2nd"], s["win_rate_3rd"], s["avg_st"]))
+    if not stats:
+        return
+    conn.executemany(
+        "INSERT INTO course_stats"
+        " (player_no,fetched_date,course_no,entry_rate,win_rate_1st,win_rate_2nd,win_rate_3rd,avg_st)"
+        " VALUES (?,?,?,?,?,?,?,?)"
+        " ON CONFLICT(player_no,fetched_date,course_no) DO UPDATE SET"
+        " entry_rate=excluded.entry_rate, win_rate_1st=excluded.win_rate_1st,"
+        " win_rate_2nd=excluded.win_rate_2nd, win_rate_3rd=excluded.win_rate_3rd,"
+        " avg_st=excluded.avg_st",
+        [(player_no, TODAY, s["course_no"], s["entry_rate"],
+          s["win_rate_1st"], s["win_rate_2nd"], s["win_rate_3rd"], s["avg_st"])
+         for s in stats]
+    )
 
 
 def save_course_stats_log(conn, player_no: str, has_data: bool) -> None:
@@ -985,28 +995,31 @@ def save_course_stats_log(conn, player_no: str, has_data: bool) -> None:
 
 
 def save_before_info(conn, race_id, entries):
-    for e in entries:
-        conn.execute("""
-            INSERT INTO before_info
-              (race_id,boat_no,weight,exhibition_time,tilt,lap_time,straight_time,
-               exhibit_course,exhibit_st,
-               prev_race_venue,prev_race_date,prev_race_no,prev_entry_course,
-               prev_start_timing,prev_finish)
-            VALUES (?,?,?,?,?,?,?,?,?,?,?,?,?,?,?)
-            ON CONFLICT(race_id,boat_no) DO UPDATE SET
-              weight=excluded.weight, exhibition_time=excluded.exhibition_time,
-              tilt=excluded.tilt, lap_time=excluded.lap_time,
-              straight_time=excluded.straight_time,
-              exhibit_course=excluded.exhibit_course,
-              exhibit_st=excluded.exhibit_st, prev_race_venue=excluded.prev_race_venue,
-              prev_race_date=excluded.prev_race_date, prev_race_no=excluded.prev_race_no,
-              prev_entry_course=excluded.prev_entry_course,
-              prev_start_timing=excluded.prev_start_timing, prev_finish=excluded.prev_finish
-        """, (race_id, e["boat_no"], e["weight"], e["exhibition_time"], e["tilt"],
-              e.get("lap_time"), e.get("straight_time"),
-              e["exhibit_course"], e["exhibit_st"], e["prev_race_venue"],
-              e["prev_race_date"], e["prev_race_no"], e["prev_entry_course"],
-              e["prev_start_timing"], e["prev_finish"]))
+    if not entries:
+        return
+    conn.executemany(
+        "INSERT INTO before_info"
+        " (race_id,boat_no,weight,exhibition_time,tilt,lap_time,straight_time,"
+        " exhibit_course,exhibit_st,"
+        " prev_race_venue,prev_race_date,prev_race_no,prev_entry_course,"
+        " prev_start_timing,prev_finish)"
+        " VALUES (?,?,?,?,?,?,?,?,?,?,?,?,?,?,?)"
+        " ON CONFLICT(race_id,boat_no) DO UPDATE SET"
+        " weight=excluded.weight, exhibition_time=excluded.exhibition_time,"
+        " tilt=excluded.tilt, lap_time=excluded.lap_time,"
+        " straight_time=excluded.straight_time,"
+        " exhibit_course=excluded.exhibit_course,"
+        " exhibit_st=excluded.exhibit_st, prev_race_venue=excluded.prev_race_venue,"
+        " prev_race_date=excluded.prev_race_date, prev_race_no=excluded.prev_race_no,"
+        " prev_entry_course=excluded.prev_entry_course,"
+        " prev_start_timing=excluded.prev_start_timing, prev_finish=excluded.prev_finish",
+        [(race_id, e["boat_no"], e["weight"], e["exhibition_time"], e["tilt"],
+          e.get("lap_time"), e.get("straight_time"),
+          e["exhibit_course"], e["exhibit_st"], e["prev_race_venue"],
+          e["prev_race_date"], e["prev_race_no"], e["prev_entry_course"],
+          e["prev_start_timing"], e["prev_finish"])
+         for e in entries]
+    )
 
 
 def _save_live_prediction(conn, race_id: int, vcode: str, rno: int) -> None:
@@ -1112,45 +1125,54 @@ def save_weather(conn, race_id, w):
 
 
 def save_race_result_entries(conn, race_id, entries):
-    for e in entries:
-        conn.execute("""
-            INSERT INTO race_result_entries
-              (race_id,rank,boat_no,player_no,player_name,race_time,
-               start_course,start_timing,winning_trick)
-            VALUES (?,?,?,?,?,?,?,?,?)
-            ON CONFLICT(race_id,rank) DO UPDATE SET
-              boat_no=excluded.boat_no, player_no=excluded.player_no,
-              player_name=excluded.player_name, race_time=excluded.race_time,
-              start_course=excluded.start_course, start_timing=excluded.start_timing,
-              winning_trick=excluded.winning_trick
-        """, (race_id, e["rank"], e["boat_no"], e["player_no"], e["player_name"],
-              e["race_time"], e["start_course"], e["start_timing"], e["winning_trick"]))
+    if not entries:
+        return
+    conn.executemany(
+        "INSERT INTO race_result_entries"
+        " (race_id,rank,boat_no,player_no,player_name,race_time,"
+        " start_course,start_timing,winning_trick)"
+        " VALUES (?,?,?,?,?,?,?,?,?)"
+        " ON CONFLICT(race_id,rank) DO UPDATE SET"
+        " boat_no=excluded.boat_no, player_no=excluded.player_no,"
+        " player_name=excluded.player_name, race_time=excluded.race_time,"
+        " start_course=excluded.start_course, start_timing=excluded.start_timing,"
+        " winning_trick=excluded.winning_trick",
+        [(race_id, e["rank"], e["boat_no"], e["player_no"], e["player_name"],
+          e["race_time"], e["start_course"], e["start_timing"], e["winning_trick"])
+         for e in entries]
+    )
 
 
 def save_payouts(conn, race_id, payouts):
-    for p in payouts:
-        conn.execute("""
-            INSERT INTO payouts (race_id,bet_type,combination,payout,popularity)
-            VALUES (?,?,?,?,?)
-            ON CONFLICT(race_id,bet_type,combination) DO UPDATE SET
-              payout=excluded.payout, popularity=excluded.popularity
-        """, (race_id, p["bet_type"], p["combination"], p["payout"], p["popularity"]))
+    if not payouts:
+        return
+    conn.executemany(
+        "INSERT INTO payouts (race_id,bet_type,combination,payout,popularity)"
+        " VALUES (?,?,?,?,?)"
+        " ON CONFLICT(race_id,bet_type,combination) DO UPDATE SET"
+        " payout=excluded.payout, popularity=excluded.popularity",
+        [(race_id, p["bet_type"], p["combination"], p["payout"], p["popularity"])
+         for p in payouts]
+    )
 
 
 def save_meet_standings(conn, venue_code, standings):
-    for s in standings:
-        conn.execute("""
-            INSERT INTO meet_standings
-              (date,venue_code,standing_rank,player_no,player_name,player_class,
-               points_rate,results_text,total_points,deductions)
-            VALUES (?,?,?,?,?,?,?,?,?,?)
-            ON CONFLICT(date,venue_code,player_no) DO UPDATE SET
-              standing_rank=excluded.standing_rank,
-              points_rate=excluded.points_rate, results_text=excluded.results_text,
-              total_points=excluded.total_points, deductions=excluded.deductions
-        """, (TODAY, venue_code, s["rank"], s["player_no"], s["player_name"],
-              s["player_class"], s["points_rate"], s["results_text"],
-              s["total_points"], s["deductions"]))
+    if not standings:
+        return
+    conn.executemany(
+        "INSERT INTO meet_standings"
+        " (date,venue_code,standing_rank,player_no,player_name,player_class,"
+        " points_rate,results_text,total_points,deductions)"
+        " VALUES (?,?,?,?,?,?,?,?,?,?)"
+        " ON CONFLICT(date,venue_code,player_no) DO UPDATE SET"
+        " standing_rank=excluded.standing_rank,"
+        " points_rate=excluded.points_rate, results_text=excluded.results_text,"
+        " total_points=excluded.total_points, deductions=excluded.deductions",
+        [(TODAY, venue_code, s["rank"], s["player_no"], s["player_name"],
+          s["player_class"], s["points_rate"], s["results_text"],
+          s["total_points"], s["deductions"])
+         for s in standings]
+    )
 
 
 # ────────────────────────────────────────────────────
@@ -1301,19 +1323,23 @@ def parse_player_season(soup: BeautifulSoup) -> dict:
 # ────────────────────────────────────────────────────
 
 def save_odds_tansho(conn, race_id: int, tansho_map: dict[int, float | None]) -> None:
-    for boat_no, odds_val in tansho_map.items():
-        conn.execute("""
-            INSERT INTO odds_tansho (race_id, boat_no, odds) VALUES (?,?,?)
-            ON CONFLICT(race_id, boat_no) DO UPDATE SET odds=excluded.odds
-        """, (race_id, boat_no, odds_val))
+    if not tansho_map:
+        return
+    conn.executemany(
+        "INSERT INTO odds_tansho (race_id, boat_no, odds) VALUES (?,?,?)"
+        " ON CONFLICT(race_id, boat_no) DO UPDATE SET odds=excluded.odds",
+        [(race_id, boat_no, odds_val) for boat_no, odds_val in tansho_map.items()]
+    )
 
 
 def save_odds_2t(conn, race_id: int, combo_map: dict[str, float | None]) -> None:
-    for combo, odds_val in combo_map.items():
-        conn.execute("""
-            INSERT INTO odds_2t (race_id, combination, odds) VALUES (?,?,?)
-            ON CONFLICT(race_id, combination) DO UPDATE SET odds=excluded.odds
-        """, (race_id, combo, odds_val))
+    if not combo_map:
+        return
+    conn.executemany(
+        "INSERT INTO odds_2t (race_id, combination, odds) VALUES (?,?,?)"
+        " ON CONFLICT(race_id, combination) DO UPDATE SET odds=excluded.odds",
+        [(race_id, combo, odds_val) for combo, odds_val in combo_map.items()]
+    )
 
 
 def calc_trick_rates_from_db(conn, player_no: str) -> dict:

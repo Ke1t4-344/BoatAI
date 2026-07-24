@@ -1049,7 +1049,7 @@ def get_races(date, venue_code):
     ]
 
 
-@st.cache_data(ttl=60)
+@st.cache_data(ttl=300)
 def get_prediction(date, venue_code, race_no, model_mode="XGBoost ML"):
     try:
         return _predict(date, venue_code, race_no), None
@@ -1926,6 +1926,15 @@ def show_home():
         now_dt   = datetime.now()
         now_time = now_dt.strftime("%H:%M")
         now_5min = (now_dt + timedelta(minutes=5)).strftime("%H:%M")
+
+        # 更新ボタン（Streamlit は自動再実行しないため手動更新が必要）
+        _ref_col, _time_col = st.columns([1, 6])
+        with _ref_col:
+            if st.button("🔄 更新", key="dl_refresh"):
+                get_deadline_races.clear()
+                st.rerun()
+        with _time_col:
+            st.caption(f"最終確認: {now_time}　🟠直前5分  🔴締切済")
 
         # 推奨買い目マップ (venue_code, race_no) -> {"honmei": combo, ...}
         with _conn() as _dc:
