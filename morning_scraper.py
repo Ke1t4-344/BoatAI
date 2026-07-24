@@ -36,7 +36,7 @@ from scraper import (
     _tl_fetch, DATA_URL, COURSE_MAX_WORKERS,
     parse_course_stats, parse_player_season,
     save_course_stats, save_course_stats_log,
-    save_player_season, calc_trick_rates_from_db,
+    save_player_season,
 )
 from db_lock import acquire_write_lock, release_write_lock
 
@@ -267,8 +267,8 @@ def _main_body() -> None:
 
                 season_data = data.get("season")
                 if season_data is not None:
-                    trick_rates = calc_trick_rates_from_db(conn4, player_no)
-                    season_data.update(trick_rates)
+                    # calc_trick_rates_from_db は scraper.py に任せる
+                    # (Turso への重いGROUP BY集計でタイムアウトするため)
                     rows = conn4.execute("""
                         SELECT e.race_id FROM entries e
                         JOIN races r ON r.id = e.race_id
