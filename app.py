@@ -2528,6 +2528,7 @@ def show_detail():
                     SELECT id FROM races WHERE date=? AND venue_code=? AND race_no=?
                 ) ORDER BY boat_no
             """, (date, vc, race_no)).fetchall()}
+            cur2 = conn2.cursor()
 
             boats_for_cs = {b["boat_no"]: (b["components"].get("player_no") or
                             entry_details.get(b["boat_no"], {}).get("player_no"), b["start_course"])
