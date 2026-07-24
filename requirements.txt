@@ -18,8 +18,5 @@ lxml>=5.1.0
 xgboost>=2.0.0
 scikit-learn>=1.4.0
 
-# Turso (libsql) 接続
-libsql-experimental>=0.0.55
-
 # 環境変数読み込み（.env）
 python-dotenv>=1.0.0

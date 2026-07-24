@@ -1,19 +1,18 @@
 #!/usr/bin/env python3
 """
-db_connect.py — DB接続の統一エントリポイント
+db_connect.py — DB接続の統一エントリポイント（Turso HTTP API版）
 
-環境変数 TURSO_URL / TURSO_TOKEN が設定されていれば Turso に接続。
-なければローカルの boatai.db にフォールバック（開発・ローカルテスト用）。
+libsql-experimental を使わず、requests で Turso HTTP API を直接叩く。
+ネイティブライブラリ不要のため Streamlit Cloud でもビルド可能。
 
-libsql_experimental は sqlite3.Row 互換の row_factory をサポートしないため、
-_TursoConn / _TursoCursor / _DictRow ラッパーで互換インターフェースを提供する。
+ローカル（TURSO_URL/TURSO_TOKEN 未設定）は従来通り SQLite にフォールバック。
 """
 
 import os
 import sqlite3
+import base64
 from pathlib import Path
 
-# .env ファイルを自動ロード
 try:
     from dotenv import load_dotenv
     load_dotenv(Path(__file__).parent / ".env")
@@ -22,27 +21,71 @@ except ImportError:
 
 TURSO_URL   = os.environ.get("TURSO_URL", "")
 TURSO_TOKEN = os.environ.get("TURSO_TOKEN", "")
-DB_PATH     = Path(__file__).parent / "boatai.db"   # ローカルフォールバック用
+DB_PATH     = Path(__file__).parent / "boatai.db"
 
 USE_TURSO = bool(TURSO_URL and TURSO_TOKEN)
 
 
 # ---------------------------------------------------------------------------
-# libsql-experimental 互換ラッパー
+# 共通ユーティリティ
+# ---------------------------------------------------------------------------
+
+def _http_url(turso_url: str) -> str:
+    """libsql:// または https:// → 正規化した https:// URL"""
+    url = turso_url.strip()
+    if url.startswith("libsql://"):
+        url = "https://" + url[len("libsql://"):]
+    return url.rstrip("/")
+
+
+def _encode_arg(v):
+    """Python 値 → Turso HTTP API の型付き引数"""
+    if v is None:
+        return {"type": "null"}
+    if isinstance(v, bool):
+        return {"type": "integer", "value": "1" if v else "0"}
+    if isinstance(v, int):
+        return {"type": "integer", "value": str(v)}
+    if isinstance(v, float):
+        return {"type": "float", "value": str(v)}
+    if isinstance(v, bytes):
+        return {"type": "blob", "base64": base64.b64encode(v).decode()}
+    return {"type": "text", "value": str(v)}
+
+
+def _decode_val(cell):
+    """Turso HTTP レスポンスのセル → Python 値"""
+    if cell is None:
+        return None
+    t = cell.get("type")
+    if t == "null":
+        return None
+    if t == "integer":
+        return int(cell["value"])
+    if t == "float":
+        return float(cell["value"])
+    if t == "blob":
+        return base64.b64decode(cell.get("base64", ""))
+    return cell.get("value")  # text
+
+
+# ---------------------------------------------------------------------------
+# _DictRow — sqlite3.Row 互換ラッパー（全パスで統一）
 # ---------------------------------------------------------------------------
 
 class _DictRow:
     """
-    sqlite3.Row 互換のラッパー（libsql-experimental 用）。
+    sqlite3.Row 互換のラッパー。
     row["col"]  → 文字列キーアクセス
     row[0]      → 数値インデックスアクセス
     dict(row)   → dict 変換
     iter(row)   → 値の順次列挙
+    row.get()   → デフォルト値付きアクセス
     """
     __slots__ = ("_data", "_keys", "_vals")
 
-    def __init__(self, cols: list, vals: tuple):
-        self._keys = cols
+    def __init__(self, cols: list, vals):
+        self._keys = list(cols)
         self._vals = tuple(vals)
         self._data = dict(zip(cols, vals))
 
@@ -67,8 +110,178 @@ class _DictRow:
         return f"<_DictRow {self._data}>"
 
 
+# ---------------------------------------------------------------------------
+# Turso HTTP API カーソル
+# ---------------------------------------------------------------------------
+
+class _HttpCursor:
+    """Turso HTTP API のレスポンスを Cursor 互換インターフェースで提供"""
+
+    def __init__(self, use_dict_row: bool = True):
+        self._cols: list = []
+        self._rows: list = []
+        self._pos: int = 0
+        self._lastrowid = None
+        self._rowcount: int = -1
+        self.description = None
+        self._use_dict_row = use_dict_row
+
+    def _load(self, result: dict):
+        cols_info = result.get("cols", [])
+        self._cols = [c["name"] for c in cols_info]
+        self.description = tuple(
+            (c["name"], None, None, None, None, None, None) for c in cols_info
+        )
+        raw_rows = result.get("rows", [])
+        self._rows = [tuple(_decode_val(cell) for cell in row) for row in raw_rows]
+        self._rowcount = result.get("affected_row_count", len(self._rows))
+        self._lastrowid = result.get("last_insert_rowid")
+        self._pos = 0
+
+    @property
+    def lastrowid(self):
+        try:
+            return int(self._lastrowid) if self._lastrowid is not None else None
+        except (TypeError, ValueError):
+            return None
+
+    @property
+    def rowcount(self):
+        return self._rowcount
+
+    def _wrap(self, row):
+        if row is None:
+            return None
+        if self._use_dict_row and self._cols:
+            return _DictRow(self._cols, row)
+        return row
+
+    def fetchone(self):
+        if self._pos >= len(self._rows):
+            return None
+        row = self._rows[self._pos]
+        self._pos += 1
+        return self._wrap(row)
+
+    def fetchall(self):
+        rows = self._rows[self._pos:]
+        self._pos = len(self._rows)
+        return [self._wrap(r) for r in rows]
+
+    def __iter__(self):
+        while self._pos < len(self._rows):
+            yield self._wrap(self._rows[self._pos])
+            self._pos += 1
+
+
+# ---------------------------------------------------------------------------
+# Turso HTTP API 接続
+# ---------------------------------------------------------------------------
+
+class _HttpConn:
+    """
+    Turso HTTP API を sqlite3.Connection 互換インターフェースで提供。
+
+    execute() は 1 クエリ = 1 HTTP リクエスト。
+    executemany() は複数ステートメントを 1 HTTP リクエストにまとめる。
+    commit() / rollback() は HTTP API の自動コミットに合わせてノーオペレーション。
+    """
+
+    def __init__(self, base_url: str, token: str, use_dict_row: bool = True):
+        import requests as _req
+        self._base_url = base_url
+        self._token = token
+        self._use_dict_row = use_dict_row
+        self._session = _req.Session()
+        self._session.headers.update({
+            "Authorization": f"Bearer {token}",
+            "Content-Type": "application/json",
+        })
+
+    @property
+    def row_factory(self):
+        return sqlite3.Row if self._use_dict_row else None
+
+    @row_factory.setter
+    def row_factory(self, value):
+        self._use_dict_row = (value is not None)
+
+    def _pipeline(self, stmts: list) -> list:
+        """
+        stmts: [{"type": "execute", "stmt": {...}}, ...]
+        → results リストを返す（close エントリは除外済み）
+        """
+        payload = {"requests": stmts + [{"type": "close"}]}
+        resp = self._session.post(
+            f"{self._base_url}/v2/pipeline",
+            json=payload,
+            timeout=30,
+        )
+        resp.raise_for_status()
+        data = resp.json()
+        results = data.get("results", [])
+        for r in results:
+            if r.get("type") == "error":
+                msg = r.get("error", {}).get("message", "Unknown Turso error")
+                raise Exception(f"Turso error: {msg}")
+        # close 結果（最後）を除いて返す
+        return results[:-1] if results else []
+
+    def execute(self, sql: str, params=()):
+        stmt: dict = {"sql": sql}
+        if params:
+            stmt["args"] = [_encode_arg(v) for v in params]
+        results = self._pipeline([{"type": "execute", "stmt": stmt}])
+        cur = _HttpCursor(self._use_dict_row)
+        if results and results[0].get("type") == "ok":
+            cur._load(results[0]["response"]["result"])
+        return cur
+
+    def executemany(self, sql: str, seq):
+        stmts = []
+        for params in seq:
+            s: dict = {"sql": sql}
+            if params:
+                s["args"] = [_encode_arg(v) for v in params]
+            stmts.append({"type": "execute", "stmt": s})
+        if stmts:
+            self._pipeline(stmts)
+
+    def executescript(self, sql: str):
+        for stmt_str in sql.split(";"):
+            s = stmt_str.strip()
+            if s:
+                self.execute(s)
+
+    def commit(self):
+        pass  # HTTP API は自動コミット
+
+    def rollback(self):
+        pass  # HTTP API はロールバック不可
+
+    def close(self):
+        try:
+            self._session.close()
+        except Exception:
+            pass
+
+    def __enter__(self):
+        return self
+
+    def __exit__(self, exc_type, exc_val, exc_tb):
+        try:
+            self.close()
+        except Exception:
+            pass
+        return False  # 例外を伝播
+
+
+# ---------------------------------------------------------------------------
+# ローカル SQLite ラッパー（フォールバック用）
+# ---------------------------------------------------------------------------
+
 class _TursoCursor:
-    """libsql Cursor ラッパー — fetchone/fetchall が _DictRow を返す。"""
+    """ローカル SQLite cursor を _DictRow で包む"""
 
     def __init__(self, cursor, use_dict_row: bool):
         self._cursor = cursor
@@ -103,35 +316,21 @@ class _TursoCursor:
         if not self._use_dict_row:
             return self._cursor.fetchall()
         cols = self._cols()
-        if cols:
-            return [_DictRow(cols, r) for r in self._cursor.fetchall()]
-        return self._cursor.fetchall()
+        return [_DictRow(cols, r) for r in self._cursor.fetchall()] if cols else self._cursor.fetchall()
 
     def __iter__(self):
-        if not self._use_dict_row:
-            yield from self._cursor
-            return
-        cols = self._cols()
-        if cols:
-            for row in self._cursor:
-                yield _DictRow(cols, row)
-        else:
-            yield from self._cursor
+        cols = self._cols() if self._use_dict_row else []
+        for row in self._cursor:
+            yield _DictRow(cols, row) if cols else row
 
 
 class _TursoConn:
-    """
-    libsql.Connection ラッパー — sqlite3.Connection 互換インターフェースを提供。
-
-    with conn: ... → 成功時 commit、例外時 rollback（close はしない）
-    conn.close()   → 明示的にクローズ
-    """
+    """ローカル SQLite 接続を _DictRow で包む"""
 
     def __init__(self, conn, use_dict_row: bool = True):
         self._conn = conn
         self._use_dict_row = use_dict_row
 
-    # row_factory 属性: sqlite3 互換のため存在させる（値はダミー）
     @property
     def row_factory(self):
         return sqlite3.Row if self._use_dict_row else None
@@ -140,18 +339,14 @@ class _TursoConn:
     def row_factory(self, value):
         self._use_dict_row = (value is not None)
 
-    def execute(self, sql, params=()):
-        # libsql_experimental はリスト不可・タプル必須なので変換
-        if params:
-            cursor = self._conn.execute(sql, tuple(params))
-        else:
-            cursor = self._conn.execute(sql)
+    def execute(self, sql: str, params=()):
+        cursor = self._conn.execute(sql, tuple(params)) if params else self._conn.execute(sql)
         return _TursoCursor(cursor, self._use_dict_row)
 
-    def executemany(self, sql, seq):
+    def executemany(self, sql: str, seq):
         return self._conn.executemany(sql, seq)
 
-    def executescript(self, sql):
+    def executescript(self, sql: str):
         return self._conn.executescript(sql)
 
     def commit(self):
@@ -177,12 +372,11 @@ class _TursoConn:
                 pass
         else:
             self.rollback()
-        # Turso はHTTP接続なので with ブロック終了時に必ずクローズ
         try:
             self.close()
         except Exception:
             pass
-        return False  # 例外を伝播させる
+        return False
 
 
 # ---------------------------------------------------------------------------
@@ -191,35 +385,30 @@ class _TursoConn:
 
 def open_db(row_factory=sqlite3.Row):
     """
-    DB接続を返す（sqlite3 互換インターフェース）。
+    DB 接続を返す（sqlite3 互換インターフェース）。
 
-    TURSO_URL / TURSO_TOKEN が設定されていれば Turso、
-    なければローカル SQLite にフォールバックする。
-
-    row_factory=sqlite3.Row（デフォルト）でカラム名アクセスが可能。
-    row_factory=None で生タプル。
+    TURSO_URL / TURSO_TOKEN が設定されていれば Turso HTTP API、
+    なければローカル SQLite にフォールバック。
     """
     if USE_TURSO:
-        import libsql_experimental as libsql
-        conn = libsql.connect(TURSO_URL, auth_token=TURSO_TOKEN)
-        return _TursoConn(conn, use_dict_row=(row_factory is not None))
+        return _HttpConn(
+            _http_url(TURSO_URL),
+            TURSO_TOKEN,
+            use_dict_row=(row_factory is not None),
+        )
     else:
         conn = sqlite3.connect(str(DB_PATH), timeout=60)
         conn.execute("PRAGMA journal_mode=WAL")
         conn.execute("PRAGMA busy_timeout=60000")
-        if row_factory is not None:
-            conn.row_factory = row_factory
-        return conn
+        return _TursoConn(conn, use_dict_row=(row_factory is not None))
 
 
 def open_db_autocommit():
-    """
-    DDL（CREATE TABLE / ALTER TABLE）用のオートコミット接続。
-    venue_scraper の ensure_oriten_columns 等で使用。
-    """
+    """DDL（CREATE TABLE / ALTER TABLE）用接続。"""
     if USE_TURSO:
-        import libsql_experimental as libsql
-        conn = libsql.connect(TURSO_URL, auth_token=TURSO_TOKEN)
-        return _TursoConn(conn, use_dict_row=False)
+        return _HttpConn(_http_url(TURSO_URL), TURSO_TOKEN, use_dict_row=False)
     else:
-        return sqlite3.connect(str(DB_PATH), timeout=30, isolation_level=None)
+        return _TursoConn(
+            sqlite3.connect(str(DB_PATH), timeout=30, isolation_level=None),
+            use_dict_row=False,
+        )
