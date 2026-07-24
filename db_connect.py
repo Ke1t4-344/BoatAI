@@ -81,6 +81,37 @@ def _decode_val(cell):
 
 
 # ---------------------------------------------------------------------------
+# _CursorProxy — conn.cursor() 互換アダプター
+# Turso HTTP API は cursor() を持たないため、既存コードの移行を最小化するための
+# 互換レイヤー。conn.cursor() → _CursorProxy を返す。
+# ---------------------------------------------------------------------------
+
+class _CursorProxy:
+    """
+    cursor = conn.cursor()
+    cursor.execute(sql, params)
+    cursor.fetchone() / cursor.fetchall()
+    という既存コードをそのまま動かすためのアダプター。
+    """
+    def __init__(self, conn):
+        self._conn = conn
+        self._cur = None
+
+    def execute(self, sql, params=()):
+        self._cur = self._conn.execute(sql, params)
+        return self
+
+    def fetchone(self):
+        return self._cur.fetchone() if self._cur else None
+
+    def fetchall(self):
+        return self._cur.fetchall() if self._cur else []
+
+    def __iter__(self):
+        return iter(self._cur) if self._cur else iter([])
+
+
+# ---------------------------------------------------------------------------
 # _DictRow — sqlite3.Row 互換ラッパー（全パスで統一）
 # ---------------------------------------------------------------------------
 
@@ -267,6 +298,9 @@ class _HttpConn:
             if s:
                 self.execute(s)
 
+    def cursor(self):
+        return _CursorProxy(self)
+
     def commit(self):
         pass  # HTTP API は自動コミット
 
@@ -362,6 +396,9 @@ class _TursoConn:
 
     def executescript(self, sql: str):
         return self._conn.executescript(sql)
+
+    def cursor(self):
+        return _CursorProxy(self)
 
     def commit(self):
         self._conn.commit()

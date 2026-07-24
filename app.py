@@ -2501,8 +2501,7 @@ def show_detail():
     # ── タブ3: 出走表・直前情報 ───────────────────────────────────────────────
     with tab_entry:
         with _conn() as conn2:
-            cur2 = conn2.cursor()
-            cur2.execute("""
+            entry_details = {r["boat_no"]: dict(r) for r in conn2.execute("""
                 SELECT boat_no, player_no, player_class, age,
                        flying_count, late_count, avg_start_timing,
                        national_win_rate, national_2ring_rate,
@@ -2511,8 +2510,7 @@ def show_detail():
                 FROM entries WHERE race_id=(
                     SELECT id FROM races WHERE date=? AND venue_code=? AND race_no=?
                 ) ORDER BY boat_no
-            """, (date, vc, race_no))
-            entry_details = {r["boat_no"]: dict(r) for r in cur2.fetchall()}
+            """, (date, vc, race_no)).fetchall()}
 
             boats_for_cs = {b["boat_no"]: (b["components"].get("player_no") or
                             entry_details.get(b["boat_no"], {}).get("player_no"), b["start_course"])

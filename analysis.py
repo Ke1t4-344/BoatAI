@@ -404,12 +404,10 @@ def get_odds_anomalies(
     Returns:
         list of dict: combo, model_rank, odds, market_prob, model_prob, gap
     """
-    cur = conn.cursor()
-    cur.execute(
+    row = conn.execute(
         "SELECT top5_combos FROM predictions WHERE race_id = ? ORDER BY predicted_at DESC LIMIT 1",
         (race_id,),
-    )
-    row = cur.fetchone()
+    ).fetchone()
     if not row:
         return []
 
@@ -419,20 +417,20 @@ def get_odds_anomalies(
     }
 
     # 最新フェッチのオッズのみ取得（fetched_at=NULLの場合も対応）
-    max_fa = cur.execute(
+    max_fa = conn.execute(
         "SELECT MAX(fetched_at) FROM odds_3t WHERE race_id=?", (race_id,)
     ).fetchone()[0]
     if max_fa is not None:
-        cur.execute(
+        odds_rows = conn.execute(
             "SELECT combination, odds FROM odds_3t WHERE race_id=? AND fetched_at=?",
             (race_id, max_fa),
-        )
+        ).fetchall()
     else:
-        cur.execute(
+        odds_rows = conn.execute(
             "SELECT combination, odds FROM odds_3t WHERE race_id=?",
             (race_id,),
-        )
-    odds_dict = {r[0]: r[1] for r in cur.fetchall()}
+        ).fetchall()
+    odds_dict = {r[0]: r[1] for r in odds_rows}
 
     results = []
     for rank, combo in enumerate(top5, 1):

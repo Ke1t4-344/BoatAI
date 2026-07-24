@@ -151,9 +151,7 @@ def _get_meet_day_form(
     try:
         td = datetime.strptime(race_date, "%Y%m%d").date()
         start_date = (td - timedelta(days=6)).strftime("%Y%m%d")
-        cur = conn.cursor()
-        # 今節 = 同一会場・直近6日以内（標準6日開催）
-        cur.execute("""
+        rows = conn.execute("""
             SELECT r.date AS race_date, rre.rank
             FROM race_result_entries rre
             JOIN races r ON r.id = rre.race_id
@@ -162,8 +160,7 @@ def _get_meet_day_form(
               AND r.date        <  ?
               AND r.date        >= ?
             ORDER BY r.date DESC
-        """, (player_no, venue_code, race_date, start_date))
-        rows = cur.fetchall()
+        """, (player_no, venue_code, race_date, start_date)).fetchall()
     except Exception:
         return None
 
@@ -588,12 +585,8 @@ def _categorize(ev: Optional[float], prob: float, odds: Optional[float], is_honm
 def predict(date: str, venue_code: str, race_no: int, conn=None) -> dict:
     _own_conn = conn is None
     if _own_conn:
-        conn = sqlite3.connect(DB_PATH, timeout=60)
-        conn.row_factory = sqlite3.Row
-        conn.execute("PRAGMA journal_mode=WAL")
-        conn.execute("PRAGMA busy_timeout=60000")
-    elif conn.row_factory is None:
-        conn.row_factory = sqlite3.Row
+        from db_connect import open_db as _open_db
+        conn = _open_db()
     cur = conn.cursor()
 
     # ---- レース取得 ----
