@@ -32,6 +32,11 @@ from scraper import (
     fetch_today_venues, fetch_race_schedule,
     init_db,
     VENUE_NAMES, BASE_URL, DB_PATH, TODAY,
+    # コース別成績・シーズン成績
+    _tl_fetch, DATA_URL, COURSE_MAX_WORKERS,
+    parse_course_stats, parse_player_season,
+    save_course_stats, save_course_stats_log,
+    save_player_season, calc_trick_rates_from_db,
 )
 from db_lock import acquire_write_lock, release_write_lock
 
@@ -184,6 +189,100 @@ def _main_body() -> None:
             release_write_lock()
 
         total_races += retry_saved
+
+    # ── 第3フェーズ: コース別成績・シーズン成績 ─────────────────────────────────
+    # 出走表が確定した直後に一括取得することで、live scraper のブロックを防ぐ。
+    log.info("=== 朝スクレイパー 第3フェーズ: コース別成績・シーズン成績取得 ===")
+    conn3 = open_db()
+    try:
+        # 今日出走する全選手を収集
+        all_player_nos = {
+            row[0] for row in conn3.execute("""
+                SELECT DISTINCT e.player_no FROM entries e
+                JOIN races r ON r.id = e.race_id
+                WHERE r.date = ? AND e.player_no IS NOT NULL
+            """, (TODAY,)).fetchall()
+        }
+
+        # 本日取得済み or 直近7日でデータなし判定済みの選手を除外
+        already = {row[0] for row in conn3.execute("""
+            SELECT player_no FROM course_stats WHERE fetched_date = ?
+            UNION
+            SELECT player_no FROM course_stats_log WHERE fetched_date = ?
+            UNION
+            SELECT player_no FROM course_stats_log
+             WHERE has_data = 0
+               AND fetched_date >= date(?, '-7 days')
+               AND fetched_date < ?
+        """, (TODAY, TODAY, TODAY, TODAY)).fetchall()}
+
+        to_fetch = sorted(all_player_nos - already)
+        log.info("  コース別成績・シーズン成績: %d名取得予定 (スキップ:%d名)",
+                 len(to_fetch), len(all_player_nos) - len(to_fetch))
+    finally:
+        conn3.close()
+
+    if to_fetch:
+        # HTTP フェッチ（ロック解放中・並列）
+        release_write_lock()
+
+        def _fetch_player_stats(pno: str) -> dict:
+            result: dict = {"player_no": pno, "course": None, "season": None}
+            soup_cs = _tl_fetch(f"{DATA_URL}/course", params={"toban": pno})
+            if soup_cs:
+                result["course"] = parse_course_stats(soup_cs)
+            soup_season = _tl_fetch(f"{DATA_URL}/season", params={"toban": pno})
+            if soup_season:
+                result["season"] = parse_player_season(soup_season)
+            return result
+
+        fetched_player_data: dict = {}
+        with ThreadPoolExecutor(max_workers=COURSE_MAX_WORKERS) as pool:
+            futures = {pool.submit(_fetch_player_stats, pno): pno for pno in to_fetch}
+            done_count = 0
+            for future in as_completed(futures):
+                pno = futures[future]
+                try:
+                    fetched_player_data[pno] = future.result()
+                    done_count += 1
+                    if done_count % 10 == 0 or done_count == len(to_fetch):
+                        log.info("  コース別成績取得進捗: %d/%d名", done_count, len(to_fetch))
+                except Exception as e:
+                    log.warning("  %s: フェッチ失敗 %s", pno, e)
+
+        # DB 書き込み（ロック再取得）
+        acquire_write_lock(wait=True, timeout=120)
+        conn4 = open_db()
+        try:
+            for player_no in to_fetch:
+                data = fetched_player_data.get(player_no)
+                if not data:
+                    continue
+
+                cs = data.get("course")
+                if cs is not None:
+                    save_course_stats(conn4, player_no, cs)
+                    save_course_stats_log(conn4, player_no, bool(cs))
+                    conn4.commit()
+
+                season_data = data.get("season")
+                if season_data is not None:
+                    trick_rates = calc_trick_rates_from_db(conn4, player_no)
+                    season_data.update(trick_rates)
+                    rows = conn4.execute("""
+                        SELECT e.race_id FROM entries e
+                        JOIN races r ON r.id = e.race_id
+                        WHERE e.player_no=? AND r.date=?
+                    """, (player_no, TODAY)).fetchall()
+                    for (rid,) in rows:
+                        save_player_season(conn4, rid, player_no, season_data)
+                    conn4.commit()
+
+            log.info("=== 朝スクレイパー 第3フェーズ完了: %d名処理 ===", len(to_fetch))
+        finally:
+            conn4.close()
+    else:
+        log.info("  コース別成績: 全選手取得済みのためスキップ")
 
     log.info("=== 朝スクレイパー 完了: 合計 %d レース ===", total_races)
 
