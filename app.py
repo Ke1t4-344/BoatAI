@@ -2517,7 +2517,8 @@ def show_detail():
 
     # ── タブ3: 出走表・直前情報 ───────────────────────────────────────────────
     with tab_entry:
-        with _conn() as conn2:
+        with st.spinner("データ読み込み中..."):
+          with _conn() as conn2:
             entry_details = {r["boat_no"]: dict(r) for r in conn2.execute("""
                 SELECT boat_no, player_no, player_class, age,
                        flying_count, late_count, avg_start_timing,
@@ -2528,36 +2529,61 @@ def show_detail():
                     SELECT id FROM races WHERE date=? AND venue_code=? AND race_no=?
                 ) ORDER BY boat_no
             """, (date, vc, race_no)).fetchall()}
-            cur2 = conn2.cursor()
 
             boats_for_cs = {b["boat_no"]: (b["components"].get("player_no") or
                             entry_details.get(b["boat_no"], {}).get("player_no"), b["start_course"])
                             for b in boats}
-            cs_rows = {}
-            for bn, (pno, cs) in boats_for_cs.items():
-                if pno:
-                    cur2.execute("""
-                        SELECT win_rate_1st, win_rate_2nd, win_rate_3rd, entry_rate, avg_st
-                        FROM course_stats WHERE player_no=? AND course_no=?
-                        ORDER BY fetched_date DESC LIMIT 1
-                    """, (pno, cs))
-                    row = cur2.fetchone()
-                    cs_rows[bn] = dict(row) if row else {}
 
-            # 負け手データ（race_result_entriesから: 1着でなかった時の1着の決まり手を集計）
-            lose_data = {}
-            for bn, (pno, _) in boats_for_cs.items():
-                if pno:
-                    rows_ld = cur2.execute("""
-                        SELECT wt.winning_trick, COUNT(*) cnt
-                        FROM race_result_entries me
-                        JOIN race_result_entries wt ON wt.race_id = me.race_id AND wt.rank = 1
-                        WHERE me.player_no = ? AND me.rank != 1
-                        GROUP BY wt.winning_trick
-                    """, (pno,)).fetchall()
-                    total_ld = sum(r["cnt"] for r in rows_ld)
+            # ── course_stats: 全選手分を1クエリで取得 ──────────────────────
+            pno_cs_pairs = [(pno, cs) for bn, (pno, cs) in boats_for_cs.items() if pno and cs is not None]
+            cs_rows = {}
+            if pno_cs_pairs:
+                where_cs = " OR ".join(["(player_no=? AND course_no=?)"] * len(pno_cs_pairs))
+                params_cs = [x for pair in pno_cs_pairs for x in pair]
+                cs_latest: dict = {}
+                for r in conn2.execute(
+                    f"SELECT player_no, course_no, win_rate_1st, win_rate_2nd, win_rate_3rd,"
+                    f" entry_rate, avg_st, fetched_date FROM course_stats WHERE {where_cs}",
+                    params_cs
+                ).fetchall():
+                    key = (r["player_no"], r["course_no"])
+                    if key not in cs_latest or (r["fetched_date"] or "") > (cs_latest[key]["fetched_date"] or ""):
+                        cs_latest[key] = dict(r)
+                for bn, (pno, cs) in boats_for_cs.items():
+                    cs_rows[bn] = cs_latest.get((pno, cs), {})
+
+            # ── race_result_entries: 全選手分を1クエリで取得してPython集計 ──
+            # 6艇×4クエリ(24 HTTP)→ 1クエリに削減
+            from collections import Counter as _Counter
+            lose_data:    dict = {}
+            trick_detail: dict = {}
+            all_pnos = [pno for pno, _ in boats_for_cs.values() if pno]
+            if all_pnos:
+                pno_ph = ",".join(["?"] * len(all_pnos))
+                rre_raw = conn2.execute(f"""
+                    SELECT me.player_no, me.boat_no, me.rank, me.winning_trick,
+                           w.winning_trick AS winner_trick, w.start_course AS winner_course
+                    FROM race_result_entries me
+                    JOIN race_result_entries w ON w.race_id = me.race_id AND w.rank = 1
+                    WHERE me.player_no IN ({pno_ph})
+                """, all_pnos).fetchall()
+
+                # player_no → 行リスト
+                from collections import defaultdict as _dd
+                player_rows: dict = _dd(list)
+                for r in rre_raw:
+                    player_rows[r["player_no"]].append(r)
+
+                for bn, (pno, _) in boats_for_cs.items():
+                    if not pno:
+                        continue
+                    rows_p = player_rows.get(pno, [])
+
+                    # lose_data
+                    loses_p = [r for r in rows_p if r["rank"] != 1]
+                    total_ld = len(loses_p)
                     if total_ld > 0:
-                        tm = {r["winning_trick"]: r["cnt"] for r in rows_ld}
+                        tm = _Counter(r["winner_trick"] for r in loses_p)
                         lose_data[bn] = {
                             "total":             total_ld,
                             "nige_lose":         round((tm.get("逃げ", 0) + tm.get("抜き", 0)) / total_ld * 100, 1),
@@ -2566,60 +2592,28 @@ def show_detail():
                             "makuri_sashi_lose": round(tm.get("まくり差し", 0) / total_ld * 100, 1),
                         }
 
-            # ── 艇番別決まり手詳細（新）──────────────────────────────────────
-            # 全体傾向・艇番別勝ち方・艇番別負け方 を一括取得
-            trick_detail = {}
-            for bn, (pno, _) in boats_for_cs.items():
-                if not pno:
-                    continue
-                # ① 全体勝ち方傾向（艇番問わず）
-                win_all = cur2.execute("""
-                    SELECT winning_trick, COUNT(*) as cnt
-                    FROM race_result_entries
-                    WHERE player_no=? AND rank=1
-                    GROUP BY winning_trick ORDER BY cnt DESC
-                """, (pno,)).fetchall()
-                total_wins_all = sum(r["cnt"] for r in win_all)
+                    # trick_detail
+                    wins_all_p  = [r for r in rows_p if r["rank"] == 1]
+                    rows_bn     = [r for r in rows_p if r["boat_no"] == bn]
+                    wins_bn     = [r for r in rows_bn if r["rank"] == 1]
+                    loses_bn    = [r for r in rows_bn if r["rank"] != 1]
+                    wa_cnt = _Counter(r["winning_trick"] for r in wins_all_p)
+                    wb_cnt = _Counter(r["winning_trick"] for r in wins_bn)
+                    lb_cnt = _Counter((r["winner_course"], r["winner_trick"]) for r in loses_bn)
+                    lb_top = sorted(lb_cnt.items(), key=lambda x: -x[1])[:12]
+                    trick_detail[bn] = {
+                        "pno":              pno,
+                        "win_all":          sorted(wa_cnt.items(), key=lambda x: -x[1]),
+                        "total_wins_all":   len(wins_all_p),
+                        "runs_boat":        len(rows_bn),
+                        "win_boat":         sorted(wb_cnt.items(), key=lambda x: -x[1]),
+                        "total_wins_boat":  len(wins_bn),
+                        "lose_boat":        [(sc, wt, cnt) for (sc, wt), cnt in lb_top],
+                        "total_loses_boat": len(loses_bn),
+                    }
 
-                # ② 艇番Xでの出走数
-                runs_boat = cur2.execute(
-                    "SELECT COUNT(*) FROM race_result_entries WHERE player_no=? AND boat_no=?",
-                    (pno, bn)
-                ).fetchone()[0]
-
-                # ③ 艇番Xでの勝ち方
-                win_boat = cur2.execute("""
-                    SELECT winning_trick, COUNT(*) as cnt
-                    FROM race_result_entries
-                    WHERE player_no=? AND boat_no=? AND rank=1
-                    GROUP BY winning_trick ORDER BY cnt DESC
-                """, (pno, bn)).fetchall()
-                total_wins_boat = sum(r["cnt"] for r in win_boat)
-
-                # ④ 艇番Xでの負け方（誰がどの決まり手で1着を取ったか）
-                lose_boat = cur2.execute("""
-                    SELECT w.start_course, w.winning_trick, COUNT(*) as cnt
-                    FROM race_result_entries me
-                    JOIN race_result_entries w ON w.race_id=me.race_id AND w.rank=1
-                    WHERE me.player_no=? AND me.boat_no=? AND me.rank!=1
-                    GROUP BY w.start_course, w.winning_trick ORDER BY cnt DESC
-                    LIMIT 12
-                """, (pno, bn)).fetchall()
-                total_loses_boat = sum(r["cnt"] for r in lose_boat)
-
-                trick_detail[bn] = {
-                    "pno":             pno,
-                    "win_all":         [(r["winning_trick"], r["cnt"]) for r in win_all],
-                    "total_wins_all":  total_wins_all,
-                    "runs_boat":       runs_boat,
-                    "win_boat":        [(r["winning_trick"], r["cnt"]) for r in win_boat],
-                    "total_wins_boat": total_wins_boat,
-                    "lose_boat":       [(r["start_course"], r["winning_trick"], r["cnt"]) for r in lose_boat],
-                    "total_loses_boat": total_loses_boat,
-                }
-
-            # before_infoは複数回スクレイプされるため MAX(id) で最新行のみ取得
-            cur2.execute("""
+            # ── before_info: 1クエリ ─────────────────────────────────────
+            prev_info = {r["boat_no"]: dict(r) for r in conn2.execute("""
                 SELECT b.boat_no, b.exhibition_time, b.tilt,
                        b.exhibit_course, b.exhibit_st,
                        b.prev_race_venue, b.prev_race_date, b.prev_entry_course,
@@ -2634,8 +2628,7 @@ def show_detail():
                     GROUP BY boat_no
                 )
                 ORDER BY b.boat_no
-            """, (date, vc, race_no))
-            prev_info = {r["boat_no"]: dict(r) for r in cur2.fetchall()}
+            """, (date, vc, race_no)).fetchall()}
 
         sub1, sub2, sub3, sub4, sub5, sub6 = st.tabs(["📋 出走表（フル）", "🎯 枠別成績", "🔄 前走・直前情報", "⚙️ モーター情報", "👥 選手相性", "🎯 出目パターン"])
 

@@ -18,5 +18,8 @@ lxml>=5.1.0
 xgboost>=2.0.0
 scikit-learn>=1.4.0
 
+# 可視化（background_gradient等で使用）
+matplotlib>=3.8.0
+
 # 環境変数読み込み（.env）
 python-dotenv>=1.0.0
