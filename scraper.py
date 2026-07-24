@@ -1026,18 +1026,22 @@ def save_before_info(conn, race_id, entries):
     )
 
 
-def _save_live_prediction(conn, race_id: int, vcode: str, rno: int) -> None:
-    """XGBoost予想を実行して predictions テーブルに保存（upsert）。"""
+def _save_live_prediction(conn, race_id: int, vcode: str, rno: int,
+                          date: str | None = None) -> None:
+    """XGBoost予想を実行して predictions テーブルに保存（upsert）。
+    date: レースの実際の日付 YYYYMMDD（省略時は TODAY）
+    """
     import json as _json
+    _date = date or TODAY  # ← 実際のレース日付を使う（翌日起動でも正しく動く）
     try:
         from ml_predict import predict_ml
-        result = predict_ml(TODAY, vcode, rno, conn=conn)
+        result = predict_ml(_date, vcode, rno, conn=conn)
     except Exception as e:
         log.warning("    ML予想スキップ (%s-%sR): %s", vcode, rno, e)
         # フォールバック: ルールベース
         try:
             from predict import predict as _predict
-            result = _predict(TODAY, vcode, rno)
+            result = _predict(_date, vcode, rno)
         except Exception as e2:
             log.warning("    ルールベース予想もスキップ: %s", e2)
             return
@@ -1562,6 +1566,20 @@ def _main_body(force: bool = False) -> None:
                     (race_id,)
                 ).fetchone()[0]
                 if needs_update > 0:
+                    _update_prediction_result(conn, race_id)
+                    conn.commit()
+                # 予想レコード自体がない場合 → レース日付で予想を生成・的中判定まで実施
+                pred_exists = conn.execute(
+                    "SELECT COUNT(*) FROM predictions WHERE race_id=?", (race_id,)
+                ).fetchone()[0]
+                if pred_exists == 0:
+                    _race_date = conn.execute(
+                        "SELECT date FROM races WHERE id=?", (race_id,)
+                    ).fetchone()
+                    _rd = _race_date[0] if _race_date else TODAY
+                    log.info("  ── %dR: 予想レコードなし → バックフィル実行 (date=%s)", rno, _rd)
+                    _save_live_prediction(conn, race_id, vcode, rno, date=_rd)
+                    conn.commit()
                     _update_prediction_result(conn, race_id)
                     conn.commit()
                 log.info("  ── %dR (race_id=%d) スキップ（確定結果取得済み）", rno, race_id)
