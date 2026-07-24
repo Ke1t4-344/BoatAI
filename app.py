@@ -2841,7 +2841,14 @@ def show_detail():
                                 st.caption("過去レース結果なし")
                             else:
                                 _hrows = []
-                                for _hd, _hvc, _hrno, _hbn, _hrank, _hst, _combo in _hist:
+                                for _hr in _hist:
+                                    _hd   = _hr["date"] if isinstance(_hr, dict) else _hr[0]
+                                    _hvc  = _hr["venue_code"] if isinstance(_hr, dict) else _hr[1]
+                                    _hrno = _hr["race_no"] if isinstance(_hr, dict) else _hr[2]
+                                    _hbn  = _hr["boat_no"] if isinstance(_hr, dict) else _hr[3]
+                                    _hrank= _hr["rank"] if isinstance(_hr, dict) else _hr[4]
+                                    _hst  = _hr["start_timing"] if isinstance(_hr, dict) else _hr[5]
+                                    _combo= _hr["combo3t"] if isinstance(_hr, dict) else _hr[6]
                                     _hrows.append({
                                         "日付":    f"{_hd[:4]}/{_hd[4:6]}/{_hd[6:]}",
                                         "会場":    _venue_names.get(_hvc, _hvc),
