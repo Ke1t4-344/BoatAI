@@ -38,6 +38,19 @@ def get_conn() -> sqlite3.Connection:
     return conn
 
 
+def _read_sql(sql: str, conn, params=None) -> pd.DataFrame:
+    """pd.read_sql_query の代替 — _HttpConn / _TursoConn 対応版。
+    pandas は DBAPI2 の cursor() を要求するが _HttpConn は持たないため、
+    conn.execute() → fetchall() → DataFrame を自前で構築する。
+    """
+    cur = conn.execute(sql, params) if params else conn.execute(sql)
+    rows = cur.fetchall()
+    if not rows:
+        cols = [d[0] for d in (cur.description or [])]
+        return pd.DataFrame(columns=cols)
+    return pd.DataFrame([{k: r[k] for k in r.keys()} for r in rows])
+
+
 # ──────────────────────────────────────────────────────────────
 # 1 & 2. 出目分析
 # ──────────────────────────────────────────────────────────────
@@ -63,7 +76,7 @@ def get_kimari_te_summary(
             GROUP BY rre.winning_trick
             ORDER BY cnt DESC
         """
-        df = pd.read_sql_query(sql, conn, params=[venue_code])
+        df = _read_sql(sql, conn, params=[venue_code])
     else:
         sql = """
             SELECT winning_trick, COUNT(*) AS cnt
@@ -72,7 +85,7 @@ def get_kimari_te_summary(
             GROUP BY winning_trick
             ORDER BY cnt DESC
         """
-        df = pd.read_sql_query(sql, conn)
+        df = _read_sql(sql, conn)
 
     if df.empty:
         return df
@@ -135,7 +148,7 @@ def get_kimari_te_distribution(
         ORDER BY winner_course, kimari_te, cnt DESC
     """
 
-    df = pd.read_sql_query(sql, conn, params=params)
+    df = _read_sql(sql, conn, params=params)
     if df.empty:
         return df
 
@@ -213,7 +226,7 @@ def get_head_to_head(
           AND rb.rank IS NOT NULL
         ORDER BY r.date DESC, r.race_no DESC
     """
-    df = pd.read_sql_query(sql, conn, params=[player_no_b, player_no_a])
+    df = _read_sql(sql, conn, params=[player_no_b, player_no_a])
 
     if df.empty:
         return {
@@ -280,7 +293,7 @@ def get_compatibility_matrix(
         HAVING cnt >= {min_count}
     """
 
-    df = pd.read_sql_query(sql, conn, params=player_nos + player_nos)
+    df = _read_sql(sql, conn, params=player_nos + player_nos)
 
     if df.empty:
         return pd.DataFrame()
@@ -307,7 +320,7 @@ def get_player_names(
         GROUP BY player_no
         ORDER BY MAX(id) DESC
     """
-    df = pd.read_sql_query(sql, conn, params=player_nos)
+    df = _read_sql(sql, conn, params=player_nos)
     return dict(zip(df["player_no"], df["player_name"]))
 
 
@@ -341,7 +354,7 @@ def get_meet_trend(
           AND rre.rank IS NOT NULL
         ORDER BY r.date, r.race_no
     """
-    df = pd.read_sql_query(sql, conn, params=[player_no, venue_code, date_from, date])
+    df = _read_sql(sql, conn, params=[player_no, venue_code, date_from, date])
 
     if df.empty:
         return {"days": [], "trend": "flat", "trend_score": 0.0}
@@ -465,7 +478,7 @@ def get_motor_performance(
         WHERE race_id = ? AND exhibition_time IS NOT NULL
         ORDER BY boat_no
     """
-    df = pd.read_sql_query(sql, conn, params=[race_id])
+    df = _read_sql(sql, conn, params=[race_id])
 
     if df.empty or len(df) < 2:
         return df
@@ -514,7 +527,7 @@ def get_st_course_profile(
           AND start_timing IS NOT NULL
           AND finish_rank  IS NOT NULL
     """
-    df = pd.read_sql_query(sql, conn, params=[player_no, course])
+    df = _read_sql(sql, conn, params=[player_no, course])
 
     df["st"] = pd.to_numeric(df["start_timing"], errors="coerce")
     df = df.dropna(subset=["st"])
@@ -559,7 +572,7 @@ def get_st_profiles_for_race(
         WHERE e.race_id = ?
         ORDER BY e.boat_no
     """
-    entries_df = pd.read_sql_query(sql, conn, params=[race_id])
+    entries_df = _read_sql(sql, conn, params=[race_id])
 
     if entries_df.empty:
         return pd.DataFrame()
@@ -618,7 +631,7 @@ def get_player_outcome_patterns(
         GROUP BY kimari_te, self_course, p2_course, p3_course
         ORDER BY kimari_te, cnt DESC
     """
-    df_win = pd.read_sql_query(sql_win, conn, params=course_params)
+    df_win = _read_sql(sql_win, conn, params=course_params)
 
     win_by_trick = {}
     if not df_win.empty:
@@ -681,7 +694,7 @@ def get_player_outcome_patterns(
         GROUP BY p1_course, self_course, p3_course
         ORDER BY cnt DESC
     """
-    df_p2 = pd.read_sql_query(sql_p2, conn, params=[player_no])
+    df_p2 = _read_sql(sql_p2, conn, params=[player_no])
     place2 = {"total": 0, "combos": []}
     if not df_p2.empty:
         total2 = int(df_p2["cnt"].sum())
@@ -714,7 +727,7 @@ def get_player_outcome_patterns(
         GROUP BY p1_course, p2_course, self_course
         ORDER BY cnt DESC
     """
-    df_p3 = pd.read_sql_query(sql_p3, conn, params=[player_no])
+    df_p3 = _read_sql(sql_p3, conn, params=[player_no])
     place3 = {"total": 0, "combos": []}
     if not df_p3.empty:
         total3 = int(df_p3["cnt"].sum())
