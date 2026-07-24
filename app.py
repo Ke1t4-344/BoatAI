@@ -939,44 +939,66 @@ def get_meet_day(date: str, venue_code: str) -> int:
     return day_num
 
 
-@st.cache_data(ttl=30)
+@st.cache_data(ttl=60)
 def get_venues(date):
+    """
+    指定日の開催会場一覧を返す。
+    1コネクション・5クエリに統合（旧: 2コネクション + N会場×1クエリ）。
+    """
     with _conn() as c:
-        race_rows = c.execute("SELECT id, venue_code FROM races WHERE date=?", (date,)).fetchall()
-    if not race_rows:
-        return []
-    venue_races = {}
-    for r in race_rows:
-        venue_races.setdefault(r["venue_code"], []).append(r["id"])
-    with _conn() as c:
-        # IN句の代わりにJOINを使用（libsql-experimentalのパラメータ制限を回避）
+        race_rows = c.execute(
+            "SELECT id, venue_code FROM races WHERE date=?", (date,)
+        ).fetchall()
+        if not race_rows:
+            return []
+
+        venue_races: dict = {}
+        for r in race_rows:
+            venue_races.setdefault(r["venue_code"], []).append(r["id"])
+
         result_ids = {r[0] for r in c.execute(
             "SELECT DISTINCT rre.race_id FROM race_result_entries rre "
-            "JOIN races r ON r.id = rre.race_id WHERE r.date=?", (date,)).fetchall()}
+            "JOIN races r ON r.id = rre.race_id WHERE r.date=?", (date,)
+        ).fetchall()}
         bi_ids = {r[0] for r in c.execute(
             "SELECT DISTINCT bi.race_id FROM before_info bi "
             "JOIN races r ON r.id = bi.race_id "
-            "WHERE bi.exhibition_time IS NOT NULL AND r.date=?", (date,)).fetchall()}
-        venue_map = {r[0]: r[1] for r in c.execute("SELECT venue_code, venue_name FROM venues").fetchall()}
-        # 開催何日目を計算（今日から遡って連続している日数）
-        meet_days = {}
-        for vc in venue_races:
-            past_dates = [r[0] for r in c.execute(
-                "SELECT DISTINCT date FROM races WHERE venue_code=? AND date<=? ORDER BY date DESC",
-                (vc, date)
-            ).fetchall()]
-            day_num = 1
-            for i in range(1, len(past_dates)):
-                try:
-                    d0 = datetime.strptime(past_dates[i - 1], "%Y%m%d")
-                    d1 = datetime.strptime(past_dates[i], "%Y%m%d")
-                    if (d0 - d1).days == 1:
-                        day_num += 1
-                    else:
-                        break
-                except Exception:
+            "WHERE bi.exhibition_time IS NOT NULL AND r.date=?", (date,)
+        ).fetchall()}
+        venue_map = {r[0]: r[1] for r in c.execute(
+            "SELECT venue_code, venue_name FROM venues"
+        ).fetchall()}
+
+        # 開催何日目: 全会場まとめて1クエリ取得 → Python側でカウント
+        vcodes = list(venue_races.keys())
+        placeholders = ",".join("?" * len(vcodes))
+        past_rows = c.execute(
+            f"SELECT venue_code, date FROM races "
+            f"WHERE venue_code IN ({placeholders}) AND date<=? "
+            f"ORDER BY venue_code, date DESC",
+            vcodes + [date]
+        ).fetchall()
+
+    # Python側で開催連続日数を計算（DB往復なし）
+    from collections import defaultdict
+    past_by_vc: dict = defaultdict(list)
+    for r in past_rows:
+        past_by_vc[r[0]].append(r[1])
+    meet_days: dict = {}
+    for vc, past_dates in past_by_vc.items():
+        day_num = 1
+        for i in range(1, len(past_dates)):
+            try:
+                d0 = datetime.strptime(past_dates[i - 1], "%Y%m%d")
+                d1 = datetime.strptime(past_dates[i], "%Y%m%d")
+                if (d0 - d1).days == 1:
+                    day_num += 1
+                else:
                     break
-            meet_days[vc] = day_num
+            except Exception:
+                break
+        meet_days[vc] = day_num
+
     return [
         {"venue_code": vc, "venue_name": venue_map.get(vc, vc),
          "race_count": len(rids),
@@ -987,37 +1009,44 @@ def get_venues(date):
     ]
 
 
-@st.cache_data(ttl=15)
+@st.cache_data(ttl=30)
 def get_races(date, venue_code):
+    """
+    指定日・会場のレース一覧を返す。
+    1コネクション・4クエリに統合（旧: 2コネクション）。
+    """
     with _conn() as c:
         races = c.execute(
-            "SELECT id, race_no, race_title, scheduled_time FROM races WHERE date=? AND venue_code=? ORDER BY race_no",
-            (date, venue_code)).fetchall()
-    if not races:
-        return []
-    ids = {r["id"] for r in races}
-    with _conn() as c:
-        # JOIN を使用（libsql-experimental の IN句パラメータ制限を回避）
+            "SELECT id, race_no, race_title, scheduled_time FROM races "
+            "WHERE date=? AND venue_code=? ORDER BY race_no",
+            (date, venue_code)
+        ).fetchall()
+        if not races:
+            return []
         result_ids = {r[0] for r in c.execute(
             "SELECT DISTINCT rre.race_id FROM race_result_entries rre "
             "JOIN races r ON r.id = rre.race_id WHERE r.date=? AND r.venue_code=?",
-            (date, venue_code)).fetchall()}
+            (date, venue_code)
+        ).fetchall()}
         bi_ids = {r[0] for r in c.execute(
             "SELECT DISTINCT bi.race_id FROM before_info bi "
             "JOIN races r ON r.id = bi.race_id "
             "WHERE bi.exhibition_time IS NOT NULL AND r.date=? AND r.venue_code=?",
-            (date, venue_code)).fetchall()}
-        # 3連単払戻金
+            (date, venue_code)
+        ).fetchall()}
         sanrentan_map = {r[0]: r[1] for r in c.execute(
             "SELECT p.race_id, p.payout FROM payouts p "
             "JOIN races r ON r.id = p.race_id "
             "WHERE p.bet_type='3連単' AND r.date=? AND r.venue_code=?",
-            (date, venue_code)).fetchall()}
-    return [{"race_no": r["race_no"], "race_title": r["race_title"] or f"{r['race_no']}R",
-             "scheduled_time": r["scheduled_time"],
-             "has_result": r["id"] in result_ids, "has_bi": r["id"] in bi_ids,
-             "sanrentan": sanrentan_map.get(r["id"])}
-            for r in races]
+            (date, venue_code)
+        ).fetchall()}
+    return [
+        {"race_no": r["race_no"], "race_title": r["race_title"] or f"{r['race_no']}R",
+         "scheduled_time": r["scheduled_time"],
+         "has_result": r["id"] in result_ids, "has_bi": r["id"] in bi_ids,
+         "sanrentan": sanrentan_map.get(r["id"])}
+        for r in races
+    ]
 
 
 @st.cache_data(ttl=60)
@@ -3763,6 +3792,34 @@ def show_analysis():
 
 
 # ─── Page: History ────────────────────────────────────────────────────────────
+@st.cache_data(ttl=300)
+def _get_history_meta():
+    """過去ページ用: 全日付リスト + 会場マップ（5分キャッシュ）"""
+    with _conn() as c:
+        dates     = [r[0] for r in c.execute(
+            "SELECT DISTINCT date FROM races ORDER BY date DESC").fetchall()]
+        venue_map = {r[0]: r[1] for r in c.execute(
+            "SELECT venue_code, venue_name FROM venues").fetchall()}
+    return dates, venue_map
+
+
+@st.cache_data(ttl=120)
+def _get_history_venue_summary(sel_date: str):
+    """指定日の会場別レース数・結果数（2分キャッシュ）"""
+    with _conn() as c:
+        rows = c.execute("""
+            SELECT r.venue_code,
+                   COUNT(*) as race_count,
+                   SUM(CASE WHEN rre.race_id IS NOT NULL THEN 1 ELSE 0 END) as result_count
+            FROM races r
+            LEFT JOIN (SELECT DISTINCT race_id FROM race_result_entries) rre ON r.id = rre.race_id
+            WHERE r.date=?
+            GROUP BY r.venue_code
+            ORDER BY r.venue_code
+        """, (sel_date,)).fetchall()
+    return [dict(r) for r in rows]
+
+
 def show_history():
     _page_header(
         "過去レース結果",
@@ -3770,11 +3827,7 @@ def show_history():
         "History",
     )
 
-    with _conn() as c:
-        dates     = [r[0] for r in c.execute(
-            "SELECT DISTINCT date FROM races ORDER BY date DESC").fetchall()]
-        venue_map = {r[0]: r[1] for r in c.execute(
-            "SELECT venue_code, venue_name FROM venues").fetchall()}
+    dates, venue_map = _get_history_meta()
 
     if not dates:
         st.info("過去データがありません。")
@@ -3790,24 +3843,13 @@ def show_history():
     _sel_day = st.selectbox("日", _days, index=len(_days)-1, format_func=lambda d: f"{int(d)}日", key="hist_day")
     sel_date = f"{_sel_year}{_sel_month}{_sel_day}"
 
-    with _conn() as c:
-        # その日の会場ごとのレース数・結果数を取得
-        rows = c.execute("""
-            SELECT r.venue_code,
-                   COUNT(*) as race_count,
-                   SUM(CASE WHEN rre.race_id IS NOT NULL THEN 1 ELSE 0 END) as result_count
-            FROM races r
-            LEFT JOIN (SELECT DISTINCT race_id FROM race_result_entries) rre ON r.id = rre.race_id
-            WHERE r.date=?
-            GROUP BY r.venue_code
-            ORDER BY r.venue_code
-        """, (sel_date,)).fetchall()
+    rows = _get_history_venue_summary(sel_date)
 
     if not rows:
         st.info("この日の開催データがありません。")
         return
 
-    venue_data = {r["venue_code"]: dict(r) for r in rows}
+    venue_data = {r["venue_code"]: r for r in rows}
 
     # 会場グリッド（公式アプリ風カード）― 全24会場を表示（非開催はグレー）
     st.markdown(f"**{sel_date[:4]}/{sel_date[4:6]}/{sel_date[6:8]}　{len(venue_data)}会場**")
@@ -3853,24 +3895,55 @@ def show_history():
             "SELECT id, race_no, race_title FROM races WHERE date=? AND venue_code=? ORDER BY race_no",
             (sel_date, sel_vc)).fetchall()
 
+        # 全レースのデータを1コネクション・3クエリで一括取得（N×1コネクションを廃止）
+        race_ids = [r["id"] for r in races]
+        all_results_raw = []
+        all_payouts_raw = []
+        all_preds_raw = []
+        if race_ids:
+            all_results_raw = c.execute(
+                "SELECT rre.race_id, rre.rank, rre.boat_no, rre.player_name, rre.start_timing "
+                "FROM race_result_entries rre "
+                "JOIN races r ON r.id = rre.race_id "
+                "WHERE r.date=? AND r.venue_code=? ORDER BY rre.race_id, rre.rank",
+                (sel_date, sel_vc)
+            ).fetchall()
+            all_payouts_raw = c.execute(
+                "SELECT p.race_id, p.bet_type, p.combination, p.payout, p.popularity "
+                "FROM payouts p JOIN races r ON r.id = p.race_id "
+                "WHERE r.date=? AND r.venue_code=? "
+                "ORDER BY p.race_id, CASE p.bet_type "
+                "WHEN '3連単' THEN 1 WHEN '3連複' THEN 2 WHEN '2連単' THEN 3 "
+                "WHEN '2連複' THEN 4 ELSE 5 END, p.popularity",
+                (sel_date, sel_vc)
+            ).fetchall()
+            all_preds_raw = c.execute(
+                "SELECT p.race_id, p.top5_combos, p.actual_combo, p.hit_top3, p.hit_top5, "
+                "p.top5_honmei, p.top5_chuana, p.top5_ana "
+                "FROM predictions p JOIN races r ON r.id = p.race_id "
+                "WHERE r.date=? AND r.venue_code=?",
+                (sel_date, sel_vc)
+            ).fetchall()
+
+    # race_id → データ辞書に変換（Python側でグループ化）
+    from collections import defaultdict
+    _results_by_race: dict = defaultdict(list)
+    for r in all_results_raw:
+        _results_by_race[r[0]].append(r)
+    _payouts_by_race: dict = defaultdict(list)
+    for r in all_payouts_raw:
+        _payouts_by_race[r[0]].append(r)
+    _preds_by_race: dict = {r[0]: r for r in all_preds_raw}
+
     for race in races:
         race_id = race["id"]
         race_no = race["race_no"]
         raw_title = race["race_title"] or ""
         title = raw_title if raw_title and raw_title != f"{race_no}R" else ""
 
-        with _conn() as c:
-            results = c.execute(
-                "SELECT rank, boat_no, player_name, start_timing FROM race_result_entries "
-                "WHERE race_id=? ORDER BY rank", (race_id,)).fetchall()
-            payouts = c.execute(
-                "SELECT bet_type, combination, payout, popularity FROM payouts "
-                "WHERE race_id=? ORDER BY CASE bet_type "
-                "WHEN '3連単' THEN 1 WHEN '3連複' THEN 2 WHEN '2連単' THEN 3 "
-                "WHEN '2連複' THEN 4 ELSE 5 END, popularity", (race_id,)).fetchall()
-            pred = c.execute(
-                "SELECT top5_combos, actual_combo, hit_top3, hit_top5, top5_honmei, top5_chuana, top5_ana FROM predictions WHERE race_id=?",
-                (race_id,)).fetchone()
+        results = _results_by_race[race_id]
+        payouts = _payouts_by_race[race_id]
+        pred    = _preds_by_race.get(race_id)
 
         top3 = [r for r in results if r["rank"] and r["rank"] <= 3]
         top3_str = "-".join(str(r["boat_no"]) for r in top3) if len(top3) == 3 else "未確定"
@@ -4024,6 +4097,121 @@ def show_finance():
 
 
 # ─── Sidebar ──────────────────────────────────────────────────────────────────
+@st.cache_data(ttl=300)
+def _get_accuracy_summary():
+    """全体集計（5分キャッシュ）— plain tuple を返す（pickle対応）"""
+    with _conn() as c:
+        row = c.execute("""
+            SELECT COUNT(*) as total,
+                   SUM(hit_top3) as h3, SUM(hit_top5) as h5,
+                   SUM(CASE WHEN hit_honmei_5  IS NOT NULL THEN 1 ELSE 0 END) as cnt_hm5,
+                   SUM(hit_honmei_5) as hm5,
+                   SUM(CASE WHEN hit_chuana_10 IS NOT NULL THEN 1 ELSE 0 END) as cnt_cu10,
+                   SUM(hit_chuana_10) as cu10,
+                   SUM(CASE WHEN hit_ana_10    IS NOT NULL THEN 1 ELSE 0 END) as cnt_an10,
+                   SUM(hit_ana_10) as an10
+            FROM predictions WHERE actual_combo IS NOT NULL
+        """).fetchone()
+        if row is None:
+            return None
+        # _DictRow → plain tuple（Streamlit cache_data の pickle に対応）
+        return (int(row[0] or 0), int(row[1] or 0), int(row[2] or 0),
+                int(row[3] or 0), int(row[4] or 0),
+                int(row[5] or 0), int(row[6] or 0),
+                int(row[7] or 0), int(row[8] or 0))
+
+
+@st.cache_data(ttl=300)
+def _get_venue_accuracy():
+    """会場別精度（5分キャッシュ）— plain tuple リストを返す"""
+    with _conn() as c:
+        rows = c.execute("""
+            SELECT r.venue_code, v.venue_name,
+                   COUNT(*) as total,
+                   SUM(CASE WHEN p.hit_honmei_5  IS NOT NULL THEN 1 ELSE 0 END) as cnt_hm5,
+                   SUM(p.hit_honmei_5) as hm5,
+                   SUM(CASE WHEN p.hit_chuana_10 IS NOT NULL THEN 1 ELSE 0 END) as cnt_cu10,
+                   SUM(p.hit_chuana_10) as cu10,
+                   SUM(CASE WHEN p.hit_ana_10    IS NOT NULL THEN 1 ELSE 0 END) as cnt_an10,
+                   SUM(p.hit_ana_10) as an10
+            FROM predictions p
+            JOIN races r ON r.id = p.race_id
+            LEFT JOIN venues v ON v.venue_code = r.venue_code
+            WHERE p.actual_combo IS NOT NULL
+            GROUP BY r.venue_code
+            ORDER BY (SUM(p.hit_honmei_5) * 1.0 / NULLIF(SUM(CASE WHEN p.hit_honmei_5 IS NOT NULL THEN 1 ELSE 0 END), 0)) DESC
+        """).fetchall()
+        return [tuple(r) for r in rows]
+
+
+@st.cache_data(ttl=300)
+def _get_hit_dates():
+    """的中あり日付一覧（5分キャッシュ）— plain tuple リストを返す"""
+    with _conn() as c:
+        rows = c.execute("""
+            SELECT DISTINCT r.date
+            FROM predictions p
+            JOIN races r ON r.id = p.race_id
+            WHERE p.actual_combo IS NOT NULL
+              AND (p.hit_honmei = 1 OR p.hit_chuana = 1 OR p.hit_ana = 1)
+            ORDER BY r.date DESC
+        """).fetchall()
+        return [tuple(r) for r in rows]
+
+
+def _init_predictions_table():
+    """
+    predictionsテーブル初期化（セッション内1回のみ実行）。
+    PRAGMA table_info で既存カラムを先に確認し、
+    不足分だけ ALTER TABLE → Turso HTTP通信を最小化。
+    """
+    if st.session_state.get("_predictions_table_ready"):
+        return
+    from db_connect import open_db as _open_db
+    conn = _open_db()
+    try:
+        # テーブル作成（存在しない場合のみ）
+        conn.execute("""
+            CREATE TABLE IF NOT EXISTS predictions (
+                id           INTEGER PRIMARY KEY AUTOINCREMENT,
+                race_id      INTEGER NOT NULL UNIQUE,
+                predicted_at TEXT    NOT NULL,
+                top5_combos  TEXT    NOT NULL,
+                actual_combo TEXT,
+                hit_top3     INTEGER,
+                hit_top5     INTEGER,
+                top5_honmei  TEXT,
+                top5_chuana  TEXT,
+                top5_ana     TEXT,
+                hit_honmei   INTEGER,
+                hit_chuana   INTEGER,
+                hit_ana      INTEGER,
+                hit_honmei_5  INTEGER,
+                hit_chuana_10 INTEGER,
+                hit_ana_10    INTEGER,
+                FOREIGN KEY (race_id) REFERENCES races(id)
+            )
+        """)
+        conn.commit()
+        # 既存カラムを1回のクエリで確認（ALTER TABLE を無駄に叩かない）
+        existing = {r[1] for r in conn.execute("PRAGMA table_info(predictions)").fetchall()}
+        need_cols = [
+            ("top5_honmei","TEXT"), ("top5_chuana","TEXT"), ("top5_ana","TEXT"),
+            ("hit_honmei","INTEGER"), ("hit_chuana","INTEGER"), ("hit_ana","INTEGER"),
+            ("hit_honmei_5","INTEGER"), ("hit_chuana_10","INTEGER"), ("hit_ana_10","INTEGER"),
+        ]
+        for col, typ in need_cols:
+            if col not in existing:
+                try:
+                    conn.execute(f"ALTER TABLE predictions ADD COLUMN {col} {typ}")
+                except Exception:
+                    pass
+        conn.commit()
+    finally:
+        conn.close()
+    st.session_state["_predictions_table_ready"] = True
+
+
 def show_accuracy():
     _page_header(
         "予想精度レポート",
@@ -4031,55 +4219,17 @@ def show_accuracy():
         "Accuracy",
     )
 
-    # テーブル初期化はSQLiteのWALモードで直接処理（アプリロック不要）
+    # テーブル初期化（セッション内1回のみ → 2回目以降はスキップ）
+    _init_predictions_table()
+
     from db_connect import open_db as _open_db
-    conn = _open_db()
 
-    # テーブル作成 + 新カラムのマイグレーション
-    conn.execute("""
-        CREATE TABLE IF NOT EXISTS predictions (
-            id           INTEGER PRIMARY KEY AUTOINCREMENT,
-            race_id      INTEGER NOT NULL UNIQUE,
-            predicted_at TEXT    NOT NULL,
-            top5_combos  TEXT    NOT NULL,
-            actual_combo TEXT,
-            hit_top3     INTEGER,
-            hit_top5     INTEGER,
-            top5_honmei  TEXT,
-            top5_chuana  TEXT,
-            top5_ana     TEXT,
-            hit_honmei   INTEGER,
-            hit_chuana   INTEGER,
-            hit_ana      INTEGER,
-            FOREIGN KEY (race_id) REFERENCES races(id)
-        )
-    """)
-    for col, typ in [("top5_honmei","TEXT"),("top5_chuana","TEXT"),("top5_ana","TEXT"),
-                     ("hit_honmei","INTEGER"),("hit_chuana","INTEGER"),("hit_ana","INTEGER"),
-                     ("hit_honmei_5","INTEGER"),("hit_chuana_10","INTEGER"),("hit_ana_10","INTEGER")]:
-        try:
-            conn.execute(f"ALTER TABLE predictions ADD COLUMN {col} {typ}")
-        except Exception:
-            pass
-    conn.commit()
-
-    # 全体集計
-    row = conn.execute("""
-        SELECT COUNT(*) as total,
-               SUM(hit_top3) as h3, SUM(hit_top5) as h5,
-               SUM(CASE WHEN hit_honmei_5  IS NOT NULL THEN 1 ELSE 0 END) as cnt_hm5,
-               SUM(hit_honmei_5) as hm5,
-               SUM(CASE WHEN hit_chuana_10 IS NOT NULL THEN 1 ELSE 0 END) as cnt_cu10,
-               SUM(hit_chuana_10) as cu10,
-               SUM(CASE WHEN hit_ana_10    IS NOT NULL THEN 1 ELSE 0 END) as cnt_an10,
-               SUM(hit_ana_10) as an10
-        FROM predictions WHERE actual_combo IS NOT NULL
-    """).fetchone()
+    # 全体集計（キャッシュ済み）
+    row = _get_accuracy_summary()
 
     total = row[0]
     if total == 0:
         st.warning("予想データがまだありません。backtest.pyを実行してください。")
-        conn.close()
         return
 
     h3, h5 = row[1] or 0, row[2] or 0
@@ -4129,22 +4279,7 @@ def show_accuracy():
         st.divider()
         st.subheader("会場別精度")
 
-        venue_rows = conn.execute("""
-            SELECT r.venue_code, v.venue_name,
-                   COUNT(*) as total,
-                   SUM(CASE WHEN p.hit_honmei_5  IS NOT NULL THEN 1 ELSE 0 END) as cnt_hm5,
-                   SUM(p.hit_honmei_5) as hm5,
-                   SUM(CASE WHEN p.hit_chuana_10 IS NOT NULL THEN 1 ELSE 0 END) as cnt_cu10,
-                   SUM(p.hit_chuana_10) as cu10,
-                   SUM(CASE WHEN p.hit_ana_10    IS NOT NULL THEN 1 ELSE 0 END) as cnt_an10,
-                   SUM(p.hit_ana_10) as an10
-            FROM predictions p
-            JOIN races r ON r.id = p.race_id
-            LEFT JOIN venues v ON v.venue_code = r.venue_code
-            WHERE p.actual_combo IS NOT NULL
-            GROUP BY r.venue_code
-            ORDER BY (SUM(p.hit_honmei_5) * 1.0 / NULLIF(SUM(CASE WHEN p.hit_honmei_5 IS NOT NULL THEN 1 ELSE 0 END), 0)) DESC
-        """).fetchall()
+        venue_rows = _get_venue_accuracy()
 
         venue_data = []
         for vr in venue_rows:
@@ -4176,15 +4311,8 @@ def show_accuracy():
     with tab_hits:
         import json as _json2
 
-        # 利用可能な日付一覧（的中あり）
-        hit_dates_raw = conn.execute("""
-            SELECT DISTINCT r.date
-            FROM predictions p
-            JOIN races r ON r.id = p.race_id
-            WHERE p.actual_combo IS NOT NULL
-              AND (p.hit_honmei = 1 OR p.hit_chuana = 1 OR p.hit_ana = 1)
-            ORDER BY r.date DESC
-        """).fetchall()
+        # 利用可能な日付一覧（的中あり・キャッシュ済み）
+        hit_dates_raw = _get_hit_dates()
         hit_date_labels = [f"{d[0][:4]}/{d[0][4:6]}/{d[0][6:]}" for d in hit_dates_raw]
         hit_date_raws   = [d[0] for d in hit_dates_raw]
 
@@ -4222,66 +4350,70 @@ def show_accuracy():
             extra_cond += " AND v.venue_name = ?"
             venue_params = [venue_filter]
 
-        hit_rows = conn.execute(f"""
-            SELECT r.date, r.venue_code, v.venue_name, r.race_no,
-                   p.top5_combos, p.actual_combo,
-                   p.hit_top3, p.hit_top5,
-                   py.payout,
-                   p.top5_honmei, p.top5_chuana, p.top5_ana
-            FROM predictions p
-            JOIN races r ON r.id = p.race_id
-            LEFT JOIN venues v ON v.venue_code = r.venue_code
-            LEFT JOIN payouts py ON py.race_id = r.id
-                AND py.bet_type = '3連単'
-                AND py.combination = p.actual_combo
-            WHERE {hit_cond}
-                AND p.actual_combo IS NOT NULL
-                {extra_cond}
-            ORDER BY r.date DESC, r.venue_code, r.race_no
-            LIMIT 300
-        """, venue_params).fetchall()
+        conn = _open_db()
+        try:
+            hit_rows = conn.execute(f"""
+                SELECT r.date, r.venue_code, v.venue_name, r.race_no,
+                       p.top5_combos, p.actual_combo,
+                       p.hit_top3, p.hit_top5,
+                       py.payout,
+                       p.top5_honmei, p.top5_chuana, p.top5_ana
+                FROM predictions p
+                JOIN races r ON r.id = p.race_id
+                LEFT JOIN venues v ON v.venue_code = r.venue_code
+                LEFT JOIN payouts py ON py.race_id = r.id
+                    AND py.bet_type = '3連単'
+                    AND py.combination = p.actual_combo
+                WHERE {hit_cond}
+                    AND p.actual_combo IS NOT NULL
+                    {extra_cond}
+                ORDER BY r.date DESC, r.venue_code, r.race_no
+                LIMIT 300
+            """, venue_params).fetchall()
 
-        st.caption(f"{hit_filter}: {len(hit_rows)}件（最大300件）")
+            st.caption(f"{hit_filter}: {len(hit_rows)}件（最大300件）")
 
-        # ── 絞り込み時サマリー（日付 or 会場が指定されている場合） ──────────
-        if raw_d is not None or venue_filter != "全会場":
-            _sum_cond = "p.actual_combo IS NOT NULL"
-            _sum_params: list = []
-            if raw_d is not None:
-                _sum_cond += " AND r.date = ?"
-                _sum_params.append(raw_d)
-            if venue_filter != "全会場":
-                _sum_cond += " AND v.venue_name = ?"
-                _sum_params.append(venue_filter)
-            _vj = ("LEFT JOIN venues v ON v.venue_code = r.venue_code"
-                   if venue_filter != "全会場" else "")
+            # ── 絞り込み時サマリー（日付 or 会場が指定されている場合） ──────────
+            if raw_d is not None or venue_filter != "全会場":
+                _sum_cond = "p.actual_combo IS NOT NULL"
+                _sum_params: list = []
+                if raw_d is not None:
+                    _sum_cond += " AND r.date = ?"
+                    _sum_params.append(raw_d)
+                if venue_filter != "全会場":
+                    _sum_cond += " AND v.venue_name = ?"
+                    _sum_params.append(venue_filter)
+                _vj = ("LEFT JOIN venues v ON v.venue_code = r.venue_code"
+                       if venue_filter != "全会場" else "")
 
-            _total = conn.execute(
-                f"SELECT COUNT(*) FROM predictions p "
-                f"JOIN races r ON r.id = p.race_id {_vj} WHERE {_sum_cond}",
-                _sum_params
-            ).fetchone()[0]
-            _hits = conn.execute(
-                f"SELECT COUNT(*) FROM predictions p "
-                f"JOIN races r ON r.id = p.race_id {_vj} "
-                f"WHERE {_sum_cond} AND {hit_cond}",
-                _sum_params
-            ).fetchone()[0]
-            _pay = conn.execute(
-                f"""SELECT COALESCE(SUM(py.payout), 0)
-                    FROM predictions p
-                    JOIN races r ON r.id = p.race_id {_vj}
-                    LEFT JOIN payouts py ON py.race_id = r.id
-                        AND py.bet_type = '3連単'
-                        AND py.combination = p.actual_combo
-                    WHERE {_sum_cond} AND {hit_cond}""",
-                _sum_params
-            ).fetchone()[0]
-            _rate = (_hits / _total * 100) if _total > 0 else 0.0
-            dc1, dc2, dc3 = st.columns(3)
-            dc1.metric("総レース数", f"{_total}R")
-            dc2.metric("レース精度", f"{_hits}/{_total}　({_rate:.1f}%)")
-            dc3.metric("的中合計払戻", f"{int(_pay):,}円")
+                _total = conn.execute(
+                    f"SELECT COUNT(*) FROM predictions p "
+                    f"JOIN races r ON r.id = p.race_id {_vj} WHERE {_sum_cond}",
+                    _sum_params
+                ).fetchone()[0]
+                _hits = conn.execute(
+                    f"SELECT COUNT(*) FROM predictions p "
+                    f"JOIN races r ON r.id = p.race_id {_vj} "
+                    f"WHERE {_sum_cond} AND {hit_cond}",
+                    _sum_params
+                ).fetchone()[0]
+                _pay = conn.execute(
+                    f"""SELECT COALESCE(SUM(py.payout), 0)
+                        FROM predictions p
+                        JOIN races r ON r.id = p.race_id {_vj}
+                        LEFT JOIN payouts py ON py.race_id = r.id
+                            AND py.bet_type = '3連単'
+                            AND py.combination = p.actual_combo
+                        WHERE {_sum_cond} AND {hit_cond}""",
+                    _sum_params
+                ).fetchone()[0]
+                _rate = (_hits / _total * 100) if _total > 0 else 0.0
+                dc1, dc2, dc3 = st.columns(3)
+                dc1.metric("総レース数", f"{_total}R")
+                dc2.metric("レース精度", f"{_hits}/{_total}　({_rate:.1f}%)")
+                dc3.metric("的中合計払戻", f"{int(_pay):,}円")
+        finally:
+            conn.close()
 
         for hr in hit_rows:
             date_s = hr[0]
@@ -4335,7 +4467,41 @@ def show_accuracy():
                                 hlit = "✅" if actual in combos else ""
                                 st.markdown(f"{label} {hlit}: `{'  '.join(combos)}`")
 
-    conn.close()
+
+@st.cache_data(ttl=30)
+def _get_odds_data(date: str, vc: str, race_no: int):
+    """オッズページ用データ一括取得（30秒キャッシュ）"""
+    with _conn() as c:
+        race_row = c.execute(
+            "SELECT id FROM races WHERE date=? AND venue_code=? AND race_no=?",
+            (date, vc, race_no)
+        ).fetchone()
+        if not race_row:
+            return None
+        race_id = race_row["id"]
+        odds_rows = c.execute(
+            "SELECT combination, odds FROM odds_3t WHERE race_id=? ORDER BY odds",
+            (race_id,)
+        ).fetchall()
+        recs_rows = c.execute(
+            "SELECT category, combo FROM daily_recommendations "
+            "WHERE date=? AND venue_code=? AND race_no=?",
+            (date, vc, race_no)
+        ).fetchall()
+        payout_row = c.execute(
+            "SELECT combination FROM payouts WHERE race_id=? AND bet_type='3連単'",
+            (race_id,)
+        ).fetchone()
+        entry_rows = c.execute(
+            "SELECT boat_no, player_name FROM entries WHERE race_id=? ORDER BY boat_no",
+            (race_id,)
+        ).fetchall()
+    return {
+        "odds":       [(r["combination"], r["odds"]) for r in odds_rows],
+        "rec_combos": {r["combo"]: r["category"] for r in recs_rows},
+        "actual_combo": payout_row["combination"] if payout_row else None,
+        "boats_info": {r["boat_no"]: r["player_name"] for r in entry_rows},
+    }
 
 
 def show_odds():
@@ -4358,41 +4524,14 @@ def show_odds():
         [f"{date[:4]}/{date[4:6]}/{date[6:8]}", "3連単"],
     )
 
-    with _conn() as c:
-        race_row = c.execute(
-            "SELECT id FROM races WHERE date=? AND venue_code=? AND race_no=?",
-            (date, vc, race_no)
-        ).fetchone()
-        if not race_row:
-            st.warning("レースデータが見つかりません。")
-            return
-        race_id = race_row["id"]
-
-        odds_rows = c.execute(
-            "SELECT combination, odds FROM odds_3t WHERE race_id=? ORDER BY odds",
-            (race_id,)
-        ).fetchall()
-
-        # おすすめ combo
-        recs_rows = c.execute(
-            "SELECT category, combo FROM daily_recommendations WHERE date=? AND venue_code=? AND race_no=?",
-            (date, vc, race_no)
-        ).fetchall()
-        rec_combos = {r["combo"]: r["category"] for r in recs_rows}
-
-        # 払戻（結果あり）
-        payout_row = c.execute("""
-            SELECT p.combination FROM payouts p
-            WHERE p.race_id=? AND p.bet_type='3連単'
-        """, (race_id,)).fetchone()
-        actual_combo = payout_row["combination"] if payout_row else None
-
-        # 艇番→選手名（オッズ表ヘッダー用）
-        entry_rows = c.execute(
-            "SELECT boat_no, player_name FROM entries WHERE race_id=? ORDER BY boat_no",
-            (race_id,)
-        ).fetchall()
-        boats_info = {r["boat_no"]: r["player_name"] for r in entry_rows}
+    _data = _get_odds_data(date, vc, race_no)
+    if _data is None:
+        st.warning("レースデータが見つかりません。")
+        return
+    odds_rows    = [{"combination": c, "odds": o} for c, o in _data["odds"]]
+    rec_combos   = _data["rec_combos"]
+    actual_combo = _data["actual_combo"]
+    boats_info   = _data["boats_info"]
 
     if not odds_rows:
         st.info("このレースのオッズデータがありません。")
@@ -4530,6 +4669,74 @@ def show_odds():
     st.markdown("".join(html_parts), unsafe_allow_html=True)
 
 
+def _init_recommend_table():
+    """daily_recommendationsテーブル初期化（セッション内1回のみ）"""
+    if st.session_state.get("_recommend_table_ready"):
+        return
+    with _conn() as c:
+        c.execute("""
+            CREATE TABLE IF NOT EXISTS daily_recommendations (
+                id             INTEGER PRIMARY KEY AUTOINCREMENT,
+                date           TEXT    NOT NULL,
+                generated_at   TEXT    NOT NULL,
+                venue_code     TEXT    NOT NULL,
+                race_no        INTEGER NOT NULL,
+                category       TEXT    NOT NULL,
+                day_rank       INTEGER NOT NULL,
+                combo          TEXT    NOT NULL,
+                prob           REAL,
+                expected_odds  REAL,
+                ev             REAL,
+                confidence     REAL,
+                actual_combo   TEXT,
+                hit            INTEGER,
+                checked_at     TEXT,
+                UNIQUE(date, venue_code, race_no, category)
+            )
+        """)
+    st.session_state["_recommend_table_ready"] = True
+
+
+@st.cache_data(ttl=60)
+def _get_recs(date: str):
+    """今日のおすすめ＋過去精度をまとめて取得（キャッシュ60秒）"""
+    with _conn() as c:
+        recs = c.execute("""
+            SELECT dr.*, r.scheduled_time
+            FROM daily_recommendations dr
+            LEFT JOIN races r
+                ON r.date = dr.date
+               AND r.venue_code = dr.venue_code
+               AND r.race_no = dr.race_no
+            WHERE dr.date = ? ORDER BY dr.category, dr.day_rank
+        """, (date,)).fetchall()
+        summary = c.execute("""
+            SELECT category,
+                   COUNT(*) as total,
+                   SUM(hit)  as hits,
+                   AVG(CASE WHEN hit=1 THEN expected_odds END) as avg_odds_hit
+            FROM daily_recommendations
+            WHERE hit IS NOT NULL
+            GROUP BY category
+        """).fetchall()
+        history = c.execute("""
+            SELECT dr.date, dr.category, dr.day_rank,
+                   dr.venue_code, dr.race_no, dr.combo,
+                   dr.prob, dr.expected_odds, dr.ev,
+                   dr.actual_combo, dr.hit
+            FROM daily_recommendations dr
+            WHERE dr.hit IS NOT NULL
+            ORDER BY dr.date DESC, dr.category, dr.day_rank
+            LIMIT 150
+        """).fetchall()
+    # キャッシュのpickle互換性のためtupleに変換
+    return (
+        [dict(r) for r in recs],
+        [dict(r) for r in summary],
+        [dict(r) for r in history],
+    )
+
+
 def show_recommend():
     _page_header(
         "今日のおすすめレース",
@@ -4537,31 +4744,7 @@ def show_recommend():
         "Recommendations",
     )
 
-    from db_connect import open_db
-    conn = open_db(row_factory=sqlite3.Row)
-
-    # テーブル初期化
-    conn.execute("""
-        CREATE TABLE IF NOT EXISTS daily_recommendations (
-            id             INTEGER PRIMARY KEY AUTOINCREMENT,
-            date           TEXT    NOT NULL,
-            generated_at   TEXT    NOT NULL,
-            venue_code     TEXT    NOT NULL,
-            race_no        INTEGER NOT NULL,
-            category       TEXT    NOT NULL,
-            day_rank       INTEGER NOT NULL,
-            combo          TEXT    NOT NULL,
-            prob           REAL,
-            expected_odds  REAL,
-            ev             REAL,
-            confidence     REAL,
-            actual_combo   TEXT,
-            hit            INTEGER,
-            checked_at     TEXT,
-            UNIQUE(date, venue_code, race_no, category)
-        )
-    """)
-    conn.commit()
+    _init_recommend_table()
 
     date = latest_date()
     date_str = f"{date[:4]}/{date[4:6]}/{date[6:8]}"
@@ -4571,16 +4754,8 @@ def show_recommend():
     CAT_COLOR = {"honmei": "#1768c9", "chuana": "#d78a00", "ana": "#d33f49"}
     CAT_ICON  = {"honmei": "◎", "chuana": "△", "ana": "☆"}
 
-    # 今日の推薦データ取得（racesテーブルから締切時刻をJOIN）
-    recs = conn.execute("""
-        SELECT dr.*, r.scheduled_time
-        FROM daily_recommendations dr
-        LEFT JOIN races r
-            ON r.date = dr.date
-           AND r.venue_code = dr.venue_code
-           AND r.race_no = dr.race_no
-        WHERE dr.date = ? ORDER BY dr.category, dr.day_rank
-    """, (date,)).fetchall()
+    recs_raw, summary_raw, history_raw = _get_recs(date)
+    recs = recs_raw
 
     tab_today, tab_history = st.tabs([f"📅 {date_str}のおすすめ", "📊 過去精度"])
 
@@ -4662,16 +4837,8 @@ def show_recommend():
                         )
 
     with tab_history:
-        # 過去精度サマリー
-        summary = conn.execute("""
-            SELECT category,
-                   COUNT(*) as total,
-                   SUM(hit)  as hits,
-                   AVG(CASE WHEN hit=1 THEN expected_odds END) as avg_odds_hit
-            FROM daily_recommendations
-            WHERE hit IS NOT NULL
-            GROUP BY category
-        """).fetchall()
+        # 過去精度サマリー（キャッシュ済み）
+        summary = summary_raw
 
         if not summary:
             st.info("まだ結果照合されたデータがありません。毎晩22時以降に自動更新されます。")
@@ -4690,17 +4857,8 @@ def show_recommend():
 
             st.divider()
 
-        # 日付別履歴
-        history = conn.execute("""
-            SELECT dr.date, dr.category, dr.day_rank,
-                   dr.venue_code, dr.race_no, dr.combo,
-                   dr.prob, dr.expected_odds, dr.ev,
-                   dr.actual_combo, dr.hit
-            FROM daily_recommendations dr
-            WHERE dr.hit IS NOT NULL
-            ORDER BY dr.date DESC, dr.category, dr.day_rank
-            LIMIT 150
-        """).fetchall()
+        # 日付別履歴（キャッシュ済み）
+        history = history_raw
 
         if history:
             st.subheader("過去の推薦履歴（結果確定分）")
@@ -4713,15 +4871,12 @@ def show_recommend():
                     "会場": VENUE_MAP.get(r["venue_code"], r["venue_code"]),
                     "R": r["race_no"],
                     "推薦": r["combo"],
-                    "結果": r["actual_combo"] or "─",
                     "確率": f"{r['prob']:.1f}%" if r["prob"] else "─",
                     "オッズ": f"{r['expected_odds']:.1f}" if r["expected_odds"] else "─",
                     "EV": f"{r['ev']:.2f}" if r["ev"] else "─",
                     "結果": "✅" if r["hit"] == 1 else "❌",
                 })
             st.dataframe(pd.DataFrame(rows_data), use_container_width=True, hide_index=True)
-
-    conn.close()
 
 
 # ─── Page: ML厳選レース ───────────────────────────────────────────────────────

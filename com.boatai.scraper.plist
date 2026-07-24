@@ -1,0 +1,27 @@
+<?xml version="1.0" encoding="UTF-8"?>
+<!DOCTYPE plist PUBLIC "-//Apple//DTD PLIST 1.0//EN" "http://www.apple.com/DTDs/PropertyList-1.0.dtd">
+<plist version="1.0">
+<dict>
+    <key>Label</key>
+    <string>com.boatai.scraper</string>
+
+    <key>ProgramArguments</key>
+    <array>
+        <string>/Users/miyoshikeita/miniconda3/envs/boatai/bin/python3</string>
+        <string>/Users/miyoshikeita/boatai/scraper.py</string>
+    </array>
+
+    <key>WorkingDirectory</key>
+    <string>/Users/miyoshikeita/boatai</string>
+
+    <key>StandardOutPath</key>
+    <string>/Users/miyoshikeita/boatai/logs/scraper_nohup.log</string>
+
+    <key>StandardErrorPath</key>
+    <string>/Users/miyoshikeita/boatai/logs/scraper_nohup.log</string>
+
+    <!-- 30分おき (1800秒) に自動実行。時間外(22:00〜08:00)はscraper.py内部でスキップ -->
+    <key>StartInterval</key>
+    <integer>1800</integer>
+</dict>
+</plist>

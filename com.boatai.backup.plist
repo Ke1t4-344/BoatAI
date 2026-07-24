@@ -1,0 +1,30 @@
+<?xml version="1.0" encoding="UTF-8"?>
+<!DOCTYPE plist PUBLIC "-//Apple//DTD PLIST 1.0//EN" "http://www.apple.com/DTDs/PropertyList-1.0.dtd">
+<plist version="1.0">
+<dict>
+    <key>Label</key>
+    <string>com.boatai.backup</string>
+
+    <key>ProgramArguments</key>
+    <array>
+        <string>/Users/miyoshikeita/miniconda3/envs/boatai/bin/python3</string>
+        <string>/Users/miyoshikeita/boatai/backup_db.py</string>
+    </array>
+
+    <key>WorkingDirectory</key>
+    <string>/Users/miyoshikeita/boatai</string>
+
+    <!-- 30分おき（毎時0分・30分） -->
+    <key>StartCalendarInterval</key>
+    <array>
+        <dict><key>Minute</key><integer>0</integer></dict>
+        <dict><key>Minute</key><integer>30</integer></dict>
+    </array>
+
+    <key>StandardOutPath</key>
+    <string>/Users/miyoshikeita/boatai/logs/backup.log</string>
+
+    <key>StandardErrorPath</key>
+    <string>/Users/miyoshikeita/boatai/logs/backup.log</string>
+</dict>
+</plist>

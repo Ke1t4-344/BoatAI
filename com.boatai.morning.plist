@@ -1,0 +1,30 @@
+<?xml version="1.0" encoding="UTF-8"?>
+<!DOCTYPE plist PUBLIC "-//Apple//DTD PLIST 1.0//EN" "http://www.apple.com/DTDs/PropertyList-1.0.dtd">
+<plist version="1.0">
+<dict>
+    <key>Label</key>
+    <string>com.boatai.morning</string>
+
+    <key>ProgramArguments</key>
+    <array>
+        <string>/Users/miyoshikeita/miniconda3/envs/boatai/bin/python3</string>
+        <string>/Users/miyoshikeita/boatai/morning_scraper.py</string>
+    </array>
+
+    <key>WorkingDirectory</key>
+    <string>/Users/miyoshikeita/boatai</string>
+
+    <!-- 毎朝6:00と6:30に起動（6:00で取れなかった分を6:30でリトライ） -->
+    <key>StartCalendarInterval</key>
+    <array>
+        <dict><key>Hour</key><integer>6</integer><key>Minute</key><integer>0</integer></dict>
+        <dict><key>Hour</key><integer>6</integer><key>Minute</key><integer>30</integer></dict>
+    </array>
+
+    <key>StandardOutPath</key>
+    <string>/Users/miyoshikeita/boatai/logs/morning_nohup.log</string>
+
+    <key>StandardErrorPath</key>
+    <string>/Users/miyoshikeita/boatai/logs/morning_nohup.log</string>
+</dict>
+</plist>

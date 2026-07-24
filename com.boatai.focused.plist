@@ -1,0 +1,27 @@
+<?xml version="1.0" encoding="UTF-8"?>
+<!DOCTYPE plist PUBLIC "-//Apple//DTD PLIST 1.0//EN" "http://www.apple.com/DTDs/PropertyList-1.0.dtd">
+<plist version="1.0">
+<dict>
+    <key>Label</key>
+    <string>com.boatai.focused</string>
+
+    <key>ProgramArguments</key>
+    <array>
+        <string>/Users/miyoshikeita/miniconda3/envs/boatai/bin/python3</string>
+        <string>/Users/miyoshikeita/boatai/focused_scraper.py</string>
+    </array>
+
+    <key>WorkingDirectory</key>
+    <string>/Users/miyoshikeita/boatai</string>
+
+    <!-- 30秒おきに自動実行（対象レースなしなら即終了） -->
+    <key>StartInterval</key>
+    <integer>30</integer>
+
+    <key>StandardOutPath</key>
+    <string>/Users/miyoshikeita/boatai/logs/focused_nohup.log</string>
+
+    <key>StandardErrorPath</key>
+    <string>/Users/miyoshikeita/boatai/logs/focused_nohup.log</string>
+</dict>
+</plist>

@@ -1,0 +1,31 @@
+<?xml version="1.0" encoding="UTF-8"?>
+<!DOCTYPE plist PUBLIC "-//Apple//DTD PLIST 1.0//EN" "http://www.apple.com/DTDs/PropertyList-1.0.dtd">
+<plist version="1.0">
+<dict>
+    <key>Label</key>
+    <string>com.boatai.app</string>
+
+    <key>ProgramArguments</key>
+    <array>
+        <string>/Users/miyoshikeita/miniconda3/envs/boatai/bin/streamlit</string>
+        <string>run</string>
+        <string>/Users/miyoshikeita/boatai/app.py</string>
+        <string>--server.address=127.0.0.1</string>
+        <string>--server.port=8501</string>
+        <string>--server.headless=true</string>
+    </array>
+
+    <key>WorkingDirectory</key>
+    <string>/Users/miyoshikeita/boatai</string>
+
+    <!-- クラッシュしたら自動再起動 -->
+    <key>KeepAlive</key>
+    <true/>
+
+    <key>StandardOutPath</key>
+    <string>/Users/miyoshikeita/boatai/logs/app.log</string>
+
+    <key>StandardErrorPath</key>
+    <string>/Users/miyoshikeita/boatai/logs/app.log</string>
+</dict>
+</plist>

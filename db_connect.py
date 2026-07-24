@@ -177,6 +177,11 @@ class _TursoConn:
                 pass
         else:
             self.rollback()
+        # Turso はHTTP接続なので with ブロック終了時に必ずクローズ
+        try:
+            self.close()
+        except Exception:
+            pass
         return False  # 例外を伝播させる
 
 

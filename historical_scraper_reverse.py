@@ -1,7 +1,7 @@
 #!/usr/bin/env python3
 """
-boatrace.jp 過去データスクレイパー
-対象期間 : 2021-01-01 〜 2025-12-31
+boatrace.jp 過去データスクレイパー（逆順版）
+対象期間 : 2025-12-31 〜 2021-01-01（新しい日付から収集）
 取得データ: 出走表 / 確定着順 / 決まり手 / 払戻金
 """
 
@@ -13,23 +13,21 @@ import time
 import random
 import logging
 import signal
-import threading
-from concurrent.futures import ThreadPoolExecutor, as_completed
 from datetime import date, datetime, timedelta
 from pathlib import Path
 
 import requests
 from bs4 import BeautifulSoup
+from db_lock import acquire_write_lock, release_write_lock
 
 # ── 設定 ──────────────────────────────────────────────
 BASE_URL      = "https://www.boatrace.jp/owpc/pc/race"
 DB_PATH       = Path(__file__).parent / "boatai.db"
 LOG_DIR       = Path(__file__).parent / "logs"
-START_DATE    = date(2021, 1, 1)
-END_DATE      = date.today() - timedelta(days=1)  # 常に昨日まで自動拡張
-REQ_DELAY_MIN = 0.5   # 並列化により会場別の総待機時間は同等
-REQ_DELAY_MAX = 0.8
-MAX_PARALLEL  = 128   # 同時HTTP接続数（会場×レース横断）
+START_DATE    = date.today() - timedelta(days=1)  # 常に昨日から開始（逆順）
+END_DATE      = date(2021,  1,  1)   # 逆順なので古い日付が終了
+REQ_DELAY_MIN = 1.0
+REQ_DELAY_MAX = 2.0
 
 HEADERS = {
     "User-Agent": (
@@ -54,16 +52,6 @@ _stop = False
 _session = requests.Session()
 _session.headers.update(HEADERS)
 log: logging.Logger = logging.getLogger(__name__)
-
-# スレッドローカルHTTPセッション（並列取得用）
-_thread_local = threading.local()
-
-def _thread_session() -> requests.Session:
-    if not hasattr(_thread_local, "s"):
-        s = requests.Session()
-        s.headers.update(HEADERS)
-        _thread_local.s = s
-    return _thread_local.s
 
 
 # ── シグナルハンドラ ──────────────────────────────────
@@ -96,7 +84,7 @@ def _retry(fn, max_wait: int = 60):
 # ── ロギング設定 ──────────────────────────────────────
 def _setup_logging() -> Path:
     LOG_DIR.mkdir(exist_ok=True)
-    log_file = LOG_DIR / f"historical_{datetime.now().strftime('%Y%m%d_%H%M%S')}.log"
+    log_file = LOG_DIR / f"historical_rev_{datetime.now().strftime('%Y%m%d_%H%M%S')}.log"
     logging.basicConfig(
         level=logging.INFO,
         format="%(asctime)s %(levelname)s %(message)s",
@@ -288,9 +276,6 @@ def init_db(conn: sqlite3.Connection) -> None:
             FOREIGN KEY (venue_code) REFERENCES venues(venue_code)
         );
 
-        -- 取得進捗管理テーブル
-        -- venue_code='DONE' は日付全体の完了マーカー
-        -- venue_code='NO_RACE' は開催なし日のマーカー
         CREATE TABLE IF NOT EXISTS scraped_history (
             date       TEXT NOT NULL,
             venue_code TEXT NOT NULL,
@@ -586,121 +571,7 @@ def fetch_max_race_no(venue_code: str, date_str: str) -> int:
     return max(race_nos) if race_nos else 12
 
 
-# ── 並列HTTP取得 ──────────────────────────────────────
-def _fetch_p(url: str, params: dict | None = None) -> BeautifulSoup | None:
-    """スレッドセーフなfetch（並列取得用）"""
-    if _stop:
-        return None
-    try:
-        resp = _thread_session().get(url, params=params, timeout=20)
-        resp.raise_for_status()
-        resp.encoding = "utf-8"
-        time.sleep(random.uniform(REQ_DELAY_MIN, REQ_DELAY_MAX))
-        return BeautifulSoup(resp.text, "html.parser")
-    except requests.RequestException as e:
-        log.warning("取得失敗(p) %s %s: %s", url, params, e)
-        time.sleep(REQ_DELAY_MIN)
-        return None
-
-
-def _fetch_one_race(date_str: str, vcode: str, rno: int) -> dict:
-    """1レースの出走表＋結果をHTTPで取得（DB書き込みなし）"""
-    entries, res_entries, payouts = [], [], []
-
-    soup = _fetch_p(f"{BASE_URL}/racelist",
-                    params={"rno": rno, "jcd": vcode, "hd": date_str})
-    if soup:
-        entries = parse_entries(soup)
-
-    if not _stop:
-        soup = _fetch_p(f"{BASE_URL}/raceresult",
-                        params={"rno": rno, "jcd": vcode, "hd": date_str})
-        if soup:
-            res_entries, payouts = parse_race_result(soup)
-
-    return {"vcode": vcode, "rno": rno,
-            "entries": entries, "res_entries": res_entries, "payouts": payouts}
-
-
-def fetch_date_data_parallel(date_str: str,
-                              venue_list: list[str],
-                              done_pairs: set) -> list[dict]:
-    """
-    指定日の全会場・全レースデータをHTTP並列取得。
-    DB書き込みは行わない（呼び出し元でシリアル書き込み）。
-    """
-    # max_race_noを並列取得
-    def _get_max_rno(vcode):
-        return vcode, fetch_max_race_no(vcode, date_str)
-
-    max_rnos: dict[str, int] = {}
-    with ThreadPoolExecutor(max_workers=min(len(venue_list), 8)) as p:
-        for vcode, max_rno in p.map(_get_max_rno, venue_list):
-            max_rnos[vcode] = max_rno
-
-    # フェッチタスク生成（取得済み会場はスキップ）
-    tasks = []
-    for vcode in venue_list:
-        if (date_str, vcode) in done_pairs:
-            continue
-        for rno in range(1, max_rnos.get(vcode, 12) + 1):
-            tasks.append((date_str, vcode, rno))
-
-    if not tasks:
-        return []
-
-    log.info("  並列フェッチ: %d件 (workers=%d)", len(tasks), MAX_PARALLEL)
-
-    results = []
-    with ThreadPoolExecutor(max_workers=MAX_PARALLEL) as executor:
-        futures = {
-            executor.submit(_fetch_one_race, ds, vc, rno): (vc, rno)
-            for ds, vc, rno in tasks
-        }
-        done_n = 0
-        for future in as_completed(futures):
-            if _stop:
-                break
-            try:
-                results.append(future.result())
-                done_n += 1
-                if done_n % MAX_PARALLEL == 0:
-                    log.info("    フェッチ進捗: %d/%d", done_n, len(tasks))
-            except Exception as e:
-                vc, rno = futures[future]
-                log.warning("並列フェッチ失敗 %s %dR: %s", vc, rno, e)
-
-    return results
-
-
-def save_date_data(conn: sqlite3.Connection, date_str: str,
-                   results: list[dict], venue_list: list[str],
-                   done_pairs: set) -> None:
-    """並列フェッチ結果をDB書き込み（シリアル）"""
-    # vcode, rno でグループ化
-    by_venue: dict[str, dict[int, dict]] = {}
-    for r in results:
-        by_venue.setdefault(r["vcode"], {})[r["rno"]] = r
-
-    now_str = datetime.now().strftime("%Y-%m-%d %H:%M:%S")
-
-    for vcode in venue_list:
-        if (date_str, vcode) in done_pairs:
-            continue
-        _retry(lambda: _upsert_venue(conn, vcode))
-        races = by_venue.get(vcode, {})
-        for rno in sorted(races.keys()):
-            data = races[rno]
-            if not data["entries"] and not data["res_entries"]:
-                continue
-            race_id = _retry(lambda rno=rno: _upsert_race(conn, date_str, vcode, rno))
-            _retry(lambda: _save_entries(conn, race_id, data["entries"]))
-            _retry(lambda: _save_race_result_entries(conn, race_id, data["res_entries"]))
-            _retry(lambda: _save_payouts(conn, race_id, data["payouts"]))
-        _retry(lambda: conn.commit())
-
-
-# ── 1会場処理（シリアル版・後方互換用） ──────────────────
+# ── 1会場処理 ──────────────────────────────────────
 def process_venue(conn: sqlite3.Connection, date_str: str, vcode: str) -> bool:
     # venue登録後すぐコミットしてロックを解放（HTTPリクエスト前に必ず解放）
     _retry(lambda: _upsert_venue(conn, vcode))
@@ -757,43 +628,29 @@ def _fmt_eta(seconds: float) -> str:
 
 
 # ── メイン ────────────────────────────────────────────
-def main() -> None:
+def _main_body() -> None:
     global log
     parser = argparse.ArgumentParser()
     parser.add_argument("--force", action="store_true", help="時間制限（8:00停止）をスキップして即時実行")
-    parser.add_argument("--start", help="取得開始日 YYYYMMDD（デフォルト: START_DATE）")
-    parser.add_argument("--end",   help="取得終了日 YYYYMMDD（デフォルト: END_DATE）")
     args = parser.parse_args()
 
     log_file = _setup_logging()
     log = logging.getLogger(__name__)
-
-    # ── DB書き込みロック取得（他スクレイパーとの同時書き込み防止） ──
-    from db_lock import check_and_acquire, release_write_lock
-    check_and_acquire("historical_scraper.py")
 
     conn = sqlite3.connect(DB_PATH, timeout=60)
     conn.execute("PRAGMA journal_mode=WAL")
     conn.execute("PRAGMA busy_timeout=60000")
     init_db(conn)
 
-    # 日付範囲の決定（--start/--end で上書き可能）
-    eff_start = date.fromisoformat(
-        f"{args.start[:4]}-{args.start[4:6]}-{args.start[6:]}"
-    ) if args.start else START_DATE
-    eff_end = date.fromisoformat(
-        f"{args.end[:4]}-{args.end[4:6]}-{args.end[6:]}"
-    ) if args.end else END_DATE
-
-    # 全日付リスト生成
+    # 全日付リストを逆順で生成（新しい日付 → 古い日付）
     all_dates: list[str] = []
-    d = eff_start
-    while d <= eff_end:
+    d = START_DATE
+    while d >= END_DATE:
         all_dates.append(d.strftime("%Y%m%d"))
-        d += timedelta(days=1)
+        d -= timedelta(days=1)
     total = len(all_dates)
 
-    # 完了済み日付・会場ペアをロード
+    # 完了済み日付をロード
     done_pairs: set[tuple[str, str]] = {
         (row[0], row[1])
         for row in conn.execute("SELECT date, venue_code FROM scraped_history")
@@ -807,8 +664,8 @@ def main() -> None:
     done_count = len(completed_dates)
 
     log.info("=" * 55)
-    log.info("boatrace.jp 過去データスクレイパー")
-    log.info("期間   : %s 〜 %s (%d日)", eff_start, eff_end, total)
+    log.info("boatrace.jp 過去データスクレイパー（逆順版）")
+    log.info("期間   : %s → %s (%d日)", START_DATE, END_DATE, total)
     log.info("取得済み: %d日 / 残り: %d日", done_count, total - done_count)
     log.info("ログ   : %s", log_file)
     log.info("Ctrl+C  : 安全に中断 → 次回実行で続きから再開")
@@ -828,13 +685,11 @@ def main() -> None:
             log.info("手動実行時は --force オプションで継続できます")
             break
 
-        # 完了済み日付はスキップ（HTTPリクエスト不要）
         if date_str in completed_dates:
             continue
 
         date_disp = f"{date_str[:4]}/{date_str[4:6]}/{date_str[6:]}"
 
-        # 開催会場を取得（1リクエスト）
         venues = fetch_venues_for_date(date_str)
         if _stop:
             break
@@ -842,7 +697,6 @@ def main() -> None:
         now_str = datetime.now().strftime("%Y-%m-%d %H:%M:%S")
 
         if not venues:
-            # 開催なし（年末年始・特別休業日等）
             conn.execute(
                 "INSERT OR REPLACE INTO scraped_history (date, venue_code, scraped_at) VALUES (?,?,?)",
                 (date_str, "NO_RACE", now_str)
@@ -858,35 +712,34 @@ def main() -> None:
             log.info("%s 開催なし  (%d/%d日)", date_disp, done_count, total)
             continue
 
-        # ── 全会場を並列フェッチ → DB書き込み ──────────────────────
-        pending_venues = [v for v in venues if (date_str, v) not in done_pairs]
-        if pending_venues:
-            vnames = " ".join(VENUE_NAMES.get(v, v) for v in pending_venues)
-            log.info("%s 並列取得開始: %s", date_disp, vnames)
-
-            # HTTPフェッチ（並列）
-            fetch_results = fetch_date_data_parallel(date_str, pending_venues, done_pairs)
-
+        interrupted = False
+        for vcode in venues:
             if _stop:
+                interrupted = True
                 break
+            if (date_str, vcode) in done_pairs:
+                continue
 
-            # DB書き込み（シリアル）
-            save_date_data(conn, date_str, fetch_results, pending_venues, done_pairs)
+            vname = VENUE_NAMES.get(vcode, vcode)
+            log.info("%s [%s] 取得開始...", date_disp, vname)
 
-            # 会場完了マーク
-            now_str = datetime.now().strftime("%Y-%m-%d %H:%M:%S")
-            for vcode in pending_venues:
+            success = process_venue(conn, date_str, vcode)
+
+            if success and not _stop:
+                now_str = datetime.now().strftime("%Y-%m-%d %H:%M:%S")
                 conn.execute(
                     "INSERT OR REPLACE INTO scraped_history (date, venue_code, scraped_at) VALUES (?,?,?)",
                     (date_str, vcode, now_str)
                 )
+                conn.commit()
                 done_pairs.add((date_str, vcode))
-            conn.commit()
+            elif _stop:
+                interrupted = True
+                break
 
-        if _stop:
+        if interrupted:
             break
 
-        # 日付全体の完了マーク
         now_str = datetime.now().strftime("%Y-%m-%d %H:%M:%S")
         conn.execute(
             "INSERT OR REPLACE INTO scraped_history (date, venue_code, scraped_at) VALUES (?,?,?)",
@@ -897,15 +750,6 @@ def main() -> None:
         done_this_run += 1
         completed_dates.add(date_str)
 
-        # 10日ごとに自動バックアップ
-        if done_this_run % 10 == 0:
-            try:
-                from db_backup import backup_db
-                backup_db(conn, label="historical")
-            except Exception as _e:
-                log.warning("バックアップ失敗: %s", _e)
-
-        # 進捗表示
         elapsed = time.monotonic() - start_time
         remaining = total - done_count
         if done_this_run > 0:
@@ -922,24 +766,13 @@ def main() -> None:
         )
 
     # WALをメインDBにフラッシュしてから終了
-    # 注意: TRUNCATE は他プロセスの読み取りスナップショットを無効化しDB破損を招くため使用禁止
-    # PASSIVE: ベストエフォート・ノンブロッキングで安全
+    # TRUNCATE はDB破損の原因になるため使用禁止 → PASSIVE に変更
     try:
         conn.execute("PRAGMA wal_checkpoint(PASSIVE)")
         log.info("WALチェックポイント(PASSIVE)完了")
     except Exception as e:
         log.warning("WALチェックポイント失敗: %s", e)
-
-    # セッション終了時に自動バックアップ
-    try:
-        from db_backup import backup_db
-        backup_db(conn, label="historical")
-    except Exception as _e:
-        log.warning("バックアップ失敗: %s", _e)
-
     conn.close()
-    release_write_lock()
-    log.info("DB書き込みロック解放")
     elapsed_total = time.monotonic() - start_time
 
     if _stop:
@@ -952,6 +785,14 @@ def main() -> None:
         log.info("総処理: %d日  所要時間: %s", done_count, _fmt_eta(elapsed_total))
 
     log.info("DB: %s", DB_PATH)
+
+
+def main() -> None:
+    acquire_write_lock(wait=True, timeout=600)
+    try:
+        _main_body()
+    finally:
+        release_write_lock()
 
 
 if __name__ == "__main__":
