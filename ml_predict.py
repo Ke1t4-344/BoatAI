@@ -424,53 +424,67 @@ def predict_ml(date: str, venue_code: str, race_no: int, conn=None) -> dict:
                        "wind_direction": w_row[4]}
 
         # ── 節内成績（NaN可 — 節初戦は0/None） ──
-        # motor meet stats: (race_id, boat_no) → stats（ml_pipeline と同じキー設計）
-        # 直近7日以内の同会場での成績を使用
+        # motor/player meet stats を1クエリずつにまとめる（6個別→1バッチ）
+        _date_iso = date[:4] + '-' + date[4:6] + '-' + date[6:]
+        _entry_rows = conn.execute(
+            "SELECT boat_no, motor_no FROM entries WHERE race_id=?", (race_id,)
+        ).fetchall()
+        _motor_list = [(r[0], r[1]) for r in _entry_rows if r[1] is not None]
+        _mno_list = [m for _, m in _motor_list]
+
         meet_motor_stats: dict = {}
-        for row_e in conn.execute("""
-            SELECT boat_no, motor_no FROM entries WHERE race_id=?
-        """, (race_id,)).fetchall():
-            bn, mno = row_e[0], row_e[1]
-            if mno is None:
-                continue
-            m_row = conn.execute("""
-                SELECT COUNT(*) as n,
+        if _mno_list:
+            _mno_ph = ",".join("?" * len(_mno_list))
+            for _mr in conn.execute(f"""
+                SELECT e2.motor_no,
+                       COUNT(*) as n,
                        SUM(CASE WHEN rre.rank<=2 THEN 1 ELSE 0 END) as top2
                 FROM entries e2
-                JOIN races r2   ON r2.id = e2.race_id
-                JOIN race_result_entries rre ON rre.race_id = e2.race_id AND rre.boat_no = e2.boat_no
-                WHERE e2.motor_no = ?
+                JOIN races r2 ON r2.id = e2.race_id
+                JOIN race_result_entries rre ON rre.race_id=e2.race_id AND rre.boat_no=e2.boat_no
+                WHERE e2.motor_no IN ({_mno_ph})
                   AND r2.venue_code = ?
                   AND r2.date >= date(?, '-7 days')
                   AND r2.date < ?
-            """, (mno, venue_code, date[:4]+'-'+date[4:6]+'-'+date[6:], date[:4]+'-'+date[4:6]+'-'+date[6:])).fetchone()
-            n = m_row[0] or 0
-            meet_motor_stats[bn] = {
-                "meet_motor_top2_rate":  (m_row[1] / n) if n > 0 else None,
-                "meet_motor_race_count": float(n),
-            }
+                GROUP BY e2.motor_no
+            """, (*_mno_list, venue_code, _date_iso, _date_iso)).fetchall():
+                n = _mr[1] or 0
+                for bn, mno in _motor_list:
+                    if mno == _mr[0]:
+                        meet_motor_stats[bn] = {
+                            "meet_motor_top2_rate":  (_mr[2] / n) if n > 0 else None,
+                            "meet_motor_race_count": float(n),
+                        }
 
-        # player meet stats: 同会場・直近7日の選手成績
+        # player meet stats: 全選手を1クエリで
+        _pno_list_ml = [(r[0], r[1]) for r in entries if r[1]]
         meet_player_stats: dict = {}
-        for row_e in entries:
-            bn, pno_e = row_e[0], row_e[1]
-            p_row = conn.execute("""
-                SELECT COUNT(*) as n,
+        if _pno_list_ml:
+            _pno_ph_ml = ",".join("?" * len(_pno_list_ml))
+            _pnos_ml = [p for _, p in _pno_list_ml]
+            _pm_map: dict = {}
+            for _pr in conn.execute(f"""
+                SELECT rre.player_no,
+                       COUNT(*) as n,
                        SUM(CASE WHEN rre.rank<=2 THEN 1 ELSE 0 END) as top2,
                        AVG(CAST(rre.rank AS REAL)) as avg_rank
                 FROM race_result_entries rre
                 JOIN races r2 ON r2.id = rre.race_id
-                WHERE rre.player_no = ?
+                WHERE rre.player_no IN ({_pno_ph_ml})
                   AND r2.venue_code = ?
                   AND r2.date >= date(?, '-7 days')
                   AND r2.date < ?
-            """, (pno_e, venue_code, date[:4]+'-'+date[4:6]+'-'+date[6:], date[:4]+'-'+date[4:6]+'-'+date[6:])).fetchone()
-            n = p_row[0] or 0
-            meet_player_stats[bn] = {
-                "meet_player_top2_rate":  (p_row[1] / n) if n > 0 else None,
-                "meet_player_avg_rank":   p_row[2] if n > 0 else None,
-                "meet_player_race_count": float(n),
-            }
+                GROUP BY rre.player_no
+            """, (*_pnos_ml, venue_code, _date_iso, _date_iso)).fetchall():
+                _pm_map[_pr[0]] = _pr
+            for bn, pno_e in _pno_list_ml:
+                _pr = _pm_map.get(pno_e)
+                n = (_pr[1] or 0) if _pr else 0
+                meet_player_stats[bn] = {
+                    "meet_player_top2_rate":  ((_pr[2] / n) if n > 0 else None) if _pr else None,
+                    "meet_player_avg_rank":   (_pr[3] if n > 0 else None) if _pr else None,
+                    "meet_player_race_count": float(n),
+                }
 
         # ── 直前情報（NaN可） ──
         bi_rows = conn.execute(

@@ -1070,7 +1070,7 @@ def get_races(date, venue_code):
     ]
 
 
-@st.cache_data(ttl=300)
+@st.cache_data(ttl=3600)
 def get_prediction(date, venue_code, race_no, model_mode="XGBoost ML"):
     try:
         return _predict(date, venue_code, race_no), None
@@ -2269,7 +2269,9 @@ def show_detail():
         "Race Detail",
         [f"{date[:4]}/{date[4:6]}/{date[6:8]}", f"開催{_meet_day_d}日目", "予想・推奨"],
     )
-    pred, err = get_prediction(date, vc, race_no, st.session_state.get("model_mode", "XGBoost ML"))
+    # ヘッダーを先行表示してから予想取得（前ページの残像を防ぐ）
+    with st.spinner("予想データ読み込み中..."):
+        pred, err = get_prediction(date, vc, race_no, st.session_state.get("model_mode", "XGBoost ML"))
     if err:
         st.error(f"予想データ取得エラー: {err}")
         return
@@ -2735,30 +2737,49 @@ def show_detail():
                         ORDER BY rre.player_no, r.date, r.race_no
                     """, (*_player_nos, vc, _meet_start, date)).fetchall()
 
-                    # 過去10走: 艇番ごとに個別クエリ（同じ艇番での成績のみ）
-                    _hist_map = {}  # key: boat_no -> list of rows
+                    # 過去10走: 全選手まとめて1クエリ（correlated subquery排除）
+                    _pno_ph2 = ",".join("?" * len(_player_nos))
+                    _all_hist_rows = _dc.execute(f"""
+                        SELECT rre.player_no, r.id AS race_id, r.date, r.venue_code, r.race_no,
+                               rre.boat_no, rre.rank, rre.start_timing
+                        FROM race_result_entries rre
+                        JOIN races r ON r.id = rre.race_id
+                        WHERE rre.player_no IN ({_pno_ph2})
+                          AND rre.rank IS NOT NULL
+                        ORDER BY rre.player_no, r.date DESC, r.race_no DESC
+                        LIMIT 600
+                    """, _player_nos).fetchall()
+
+                    # 各レースの3連単を別途1クエリで取得
+                    _hist_race_ids = list({r["race_id"] for r in _all_hist_rows})
+                    _combo_map: dict = {}
+                    if _hist_race_ids:
+                        _rid_ph = ",".join("?" * len(_hist_race_ids))
+                        for _cr in _dc.execute(f"""
+                            SELECT b1.race_id,
+                                   b1.boat_no || '-' || b2.boat_no || '-' || b3.boat_no AS combo3t
+                            FROM race_result_entries b1
+                            JOIN race_result_entries b2 ON b2.race_id=b1.race_id AND b2.rank=2
+                            JOIN race_result_entries b3 ON b3.race_id=b1.race_id AND b3.rank=3
+                            WHERE b1.race_id IN ({_rid_ph}) AND b1.rank=1
+                        """, _hist_race_ids).fetchall():
+                            _combo_map[_cr["race_id"]] = _cr["combo3t"]
+
+                    # Python側で艇番ごとに上位10件を抽出
+                    from collections import defaultdict as _dd2
+                    _hist_by_key: dict = _dd2(list)
+                    for _hr in _all_hist_rows:
+                        _key = (_hr["player_no"], _hr["boat_no"])
+                        if len(_hist_by_key[_key]) < 10:
+                            _hist_by_key[_key].append(
+                                dict(_hr) | {"combo3t": _combo_map.get(_hr["race_id"])}
+                            )
+
+                    _hist_map = {}
                     for _b2 in boats:
                         _pno2 = _boat_pno.get(_b2["boat_no"])
                         _bno2 = _b2["boat_no"]
-                        if not _pno2:
-                            _hist_map[_bno2] = []
-                            continue
-                        _rows2 = _dc.execute("""
-                            SELECT r.date, r.venue_code, r.race_no, e.boat_no, rre.rank, rre.start_timing,
-                                   (SELECT b1.boat_no || '-' || b2.boat_no || '-' || b3.boat_no
-                                    FROM race_result_entries b1
-                                    JOIN race_result_entries b2 ON b2.race_id=b1.race_id AND b2.rank=2
-                                    JOIN race_result_entries b3 ON b3.race_id=b1.race_id AND b3.rank=3
-                                    WHERE b1.race_id=r.id AND b1.rank=1) as combo3t
-                            FROM race_result_entries rre
-                            JOIN races r ON r.id=rre.race_id
-                            JOIN entries e ON e.race_id=r.id AND e.boat_no=rre.boat_no
-                            WHERE e.player_no=? AND e.boat_no=?
-                              AND rre.rank IS NOT NULL
-                            ORDER BY r.date DESC, r.race_no DESC
-                            LIMIT 10
-                        """, (_pno2, _bno2)).fetchall()
-                        _hist_map[_bno2] = _rows2
+                        _hist_map[_bno2] = _hist_by_key.get((_pno2, _bno2), []) if _pno2 else []
 
                 from collections import defaultdict as _dd
                 _ks_map = _dd(list)
