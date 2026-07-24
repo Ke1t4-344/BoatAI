@@ -82,7 +82,8 @@ def _load_models():
     with open(MODELS_DIR / "feature_cols.json") as f:
         _feature_cols = json.load(f)
 
-    conn = sqlite3.connect(DB_PATH, timeout=120)
+    from db_connect import open_db as _open_db
+    conn = _open_db()
 
     # ── course_stats（公式ウェブ取得） ──
     rows = conn.execute("""
@@ -384,8 +385,8 @@ def predict_ml(date: str, venue_code: str, race_no: int, conn=None) -> dict:
 
     _own_conn = conn is None
     if _own_conn:
-        conn = sqlite3.connect(DB_PATH, timeout=60)
-        conn.execute("PRAGMA journal_mode=WAL")
+        from db_connect import open_db as _open_db
+        conn = _open_db()
 
     try:
         # ── レースID・タイトル取得 ──
