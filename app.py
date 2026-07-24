@@ -906,9 +906,29 @@ def nav(page, **kw):
 
 
 # ─── DB helpers ───────────────────────────────────────────────────────────────
+class _ConnProxy:
+    """requests.Session を使い回すため、close() しない接続ラッパー。
+    Turso HTTP API は毎回新規セッションを作ると TLS ハンドシェイクが発生し低速になる。
+    st.session_state に保持することで、ユーザーセッション中は1回の TLS で済む。"""
+    __slots__ = ("_c",)
+    def __init__(self, conn):         self._c = conn
+    def __enter__(self):              return self
+    def __exit__(self, *_):           pass          # close しない
+    def execute(self, sql, params=()):return self._c.execute(sql, params)
+    def executemany(self, sql, seq):  return self._c.executemany(sql, seq)
+    def commit(self):                 return self._c.commit()
+    @property
+    def row_factory(self):            return self._c.row_factory
+    @row_factory.setter
+    def row_factory(self, v):         self._c.row_factory = v
+
+
 def _conn():
     from db_connect import open_db
-    return open_db(row_factory=sqlite3.Row)
+    _KEY = "_db_conn"
+    if _KEY not in st.session_state or st.session_state[_KEY] is None:
+        st.session_state[_KEY] = open_db(row_factory=sqlite3.Row)
+    return _ConnProxy(st.session_state[_KEY])
 
 
 @st.cache_data(ttl=120)
@@ -1931,10 +1951,10 @@ def show_home():
         _ref_col, _time_col = st.columns([1, 6])
         with _ref_col:
             if st.button("🔄 更新", key="dl_refresh"):
-                get_deadline_races.clear()
+                st.cache_data.clear()   # 全キャッシュをリセット（結果・予想含む）
                 st.rerun()
         with _time_col:
-            st.caption(f"最終確認: {now_time}　🟠直前5分  🔴締切済")
+            st.caption(f"最終確認: {now_time}　🟠直前5分以内  🔴締切済")
 
         # 推奨買い目マップ (venue_code, race_no) -> {"honmei": combo, ...}
         with _conn() as _dc:
