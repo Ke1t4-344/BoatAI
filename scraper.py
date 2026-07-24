@@ -77,11 +77,12 @@ def init_db(conn: sqlite3.Connection) -> None:
         );
 
         CREATE TABLE IF NOT EXISTS races (
-            id         INTEGER PRIMARY KEY AUTOINCREMENT,
-            date       TEXT    NOT NULL,
-            venue_code TEXT    NOT NULL,
-            race_no    INTEGER NOT NULL,
-            race_title TEXT,
+            id             INTEGER PRIMARY KEY AUTOINCREMENT,
+            date           TEXT    NOT NULL,
+            venue_code     TEXT    NOT NULL,
+            race_no        INTEGER NOT NULL,
+            race_title     TEXT,
+            scheduled_time TEXT,
             UNIQUE (date, venue_code, race_no),
             FOREIGN KEY (venue_code) REFERENCES venues(venue_code)
         );

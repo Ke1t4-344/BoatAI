@@ -38,6 +38,12 @@ def _jst_now() -> datetime:
 def main() -> None:
     log.info("=== Railway Scraper Worker 起動 (interval=%ds) ===", LOOP_INTERVAL)
 
+    # 環境変数確認ログ（秘密情報は出力しない）
+    turso_url   = os.environ.get("TURSO_URL", "")
+    turso_token = os.environ.get("TURSO_TOKEN", "")
+    use_turso   = bool(turso_url and turso_token)
+    log.info("DB接続モード: %s", "Turso (クラウド)" if use_turso else "⚠️ ローカルSQLite（TURSO_URL/TOKEN未設定）")
+
     import scraper
 
     while True:
