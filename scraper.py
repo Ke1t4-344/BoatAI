@@ -19,7 +19,10 @@ import time
 import threading
 import logging
 from concurrent.futures import ThreadPoolExecutor, as_completed
-from datetime import date, datetime
+from datetime import date, datetime, timezone, timedelta
+
+# Railway (UTC) でも正しい JST 日付・時刻を使うために明示
+_JST = timezone(timedelta(hours=9))
 from pathlib import Path
 
 import requests
@@ -30,7 +33,7 @@ from db_lock import acquire_write_lock, release_write_lock
 BASE_URL  = "https://www.boatrace.jp/owpc/pc/race"
 DATA_URL  = "https://www.boatrace.jp/owpc/pc/data/racersearch"
 DB_PATH   = Path(__file__).parent / "boatai.db"
-TODAY     = date.today().strftime("%Y%m%d")
+TODAY     = datetime.now(_JST).strftime("%Y%m%d")  # JST 当日日付
 REQ_DELAY = 0.8
 
 logging.basicConfig(
@@ -1042,7 +1045,7 @@ def _save_live_prediction(conn, race_id: int, vcode: str, rno: int) -> None:
     honmei_list = [d["combo"] for d in result.get("honmei_detail", [])]
     chuana_list = [d["combo"] for d in result.get("chuana_detail", [])]
     ana_list    = [d["combo"] for d in result.get("ana_detail", [])]
-    now         = datetime.now().strftime("%Y-%m-%d %H:%M:%S")
+    now         = datetime.now(_JST).strftime("%Y-%m-%d %H:%M:%S")
 
     conn.execute("""
         INSERT INTO predictions
@@ -1496,10 +1499,10 @@ def main(force: bool = False) -> None:
 def _main_body(force: bool = False) -> None:
     # 23:30〜07:30 は historical_scraper と競合するため実行しない
     # --force オプション指定時はこの制限をスキップ（手動補完用）
-    now = datetime.now()
+    now = datetime.now(_JST)  # Railway (UTC) でも JST を使用
     now_minutes = now.hour * 60 + now.minute
     if not force and not (7 * 60 + 30 <= now_minutes < 23 * 60 + 30):
-        log.info("23:30〜07:30 は historical_scraper 専用時間帯のため終了します (time=%02d:%02d)", now.hour, now.minute)
+        log.info("23:30〜07:30 は historical_scraper 専用時間帯のため終了します (JST=%02d:%02d)", now.hour, now.minute)
         return
 
     log.info("=== boatrace.jp スクレイパー 開始 (日付: %s) ===", TODAY)

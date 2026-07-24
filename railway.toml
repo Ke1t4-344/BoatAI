@@ -1,0 +1,11 @@
+# Railway デプロイ設定
+# Streamlit アプリは Streamlit Cloud で別ホスト。
+# このファイルはスクレイパー Worker サービス用。
+
+[build]
+builder = "nixpacks"
+
+[deploy]
+startCommand = "python run_scraper.py"
+restartPolicyType = "always"
+restartPolicyMaxRetries = 10
