@@ -39,7 +39,15 @@ def _http_url(turso_url: str) -> str:
 
 
 def _encode_arg(v):
-    """Python 値 → Turso HTTP API の型付き引数"""
+    """Python 値 → Turso HTTP API (hrana) の型付き引数
+
+    hrana プロトコル仕様:
+      integer → value は文字列（64bit整数がJSONの精度を超えるため）
+      float   → value は JSON 数値（文字列不可）
+      text    → value は文字列
+      blob    → base64 文字列
+    """
+    import math
     if v is None:
         return {"type": "null"}
     if isinstance(v, bool):
@@ -47,7 +55,10 @@ def _encode_arg(v):
     if isinstance(v, int):
         return {"type": "integer", "value": str(v)}
     if isinstance(v, float):
-        return {"type": "float", "value": str(v)}
+        # NaN / Inf は JSON で表現できないので null に変換
+        if math.isnan(v) or math.isinf(v):
+            return {"type": "null"}
+        return {"type": "float", "value": v}   # ← JSON 数値（文字列ではない）
     if isinstance(v, bytes):
         return {"type": "blob", "base64": base64.b64encode(v).decode()}
     return {"type": "text", "value": str(v)}
@@ -217,7 +228,10 @@ class _HttpConn:
             json=payload,
             timeout=30,
         )
-        resp.raise_for_status()
+        if not resp.ok:
+            raise Exception(
+                f"Turso HTTP {resp.status_code} {resp.reason}: {resp.text[:500]}"
+            )
         data = resp.json()
         results = data.get("results", [])
         for r in results:
