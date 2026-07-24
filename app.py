@@ -2464,12 +2464,11 @@ def show_detail():
         if _race_id_ev:
             _rid_ev = _race_id_ev[0]
 
-            @st.cache_data(ttl=120, show_spinner=False)
-            def _cached_anomalies(rid):
+            try:
                 with _conn() as c:
-                    return _analysis.get_odds_anomalies(c, rid, min_gap=3.0)
-
-            anomalies = _cached_anomalies(_rid_ev)
+                    anomalies = _analysis.get_odds_anomalies(c, _rid_ev, min_gap=3.0)
+            except Exception:
+                anomalies = []
 
             if not anomalies:
                 st.info("predictionsデータがないか、歪みが検出されませんでした。（backtestデータ蓄積後に有効になります）")
