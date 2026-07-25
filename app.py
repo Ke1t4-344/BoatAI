@@ -1492,8 +1492,8 @@ def ensure_bets():
 
 def check_bet_result(date, venue_code, race_no, combination, bet_type):
     with _conn() as c:
-        n = c.execute("""SELECT COUNT(*) FROM race_result_entries rre
-            JOIN races r ON r.id = rre.race_id
+        n = c.execute("""SELECT COUNT(*) FROM races r
+            JOIN race_result_entries rre ON rre.race_id = r.id
             WHERE r.date=? AND r.venue_code=? AND r.race_no=?""",
             (date, venue_code, race_no)).fetchone()[0]
         if not n: return "unknown", 0
@@ -4529,7 +4529,7 @@ def show_accuracy():
                                 st.markdown(f"{label} {hlit}: `{'  '.join(combos)}`")
 
 
-@st.cache_data(ttl=30)
+@st.cache_data(ttl=60)
 def _get_odds_data(date: str, vc: str, race_no: int):
     """オッズページ用データ一括取得（30秒キャッシュ）"""
     with _conn() as c:
@@ -4758,7 +4758,7 @@ def _init_recommend_table():
     st.session_state["_recommend_table_ready"] = True
 
 
-@st.cache_data(ttl=60)
+@st.cache_data(ttl=300)
 def _get_recs(date: str):
     """今日のおすすめ＋過去精度をまとめて取得（キャッシュ60秒）"""
     with _conn() as c:

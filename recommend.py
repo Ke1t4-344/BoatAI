@@ -224,8 +224,8 @@ def check(conn: sqlite3.Connection, date: str, verbose: bool = True):
 
     for rec_id, venue_code, race_no, top_combo, top5_json, category, day_rank in rows:
         actual = conn.execute("""
-            SELECT rre.boat_no FROM race_result_entries rre
-            JOIN races r ON r.id = rre.race_id
+            SELECT rre.boat_no FROM races r
+            JOIN race_result_entries rre ON rre.race_id = r.id
             WHERE r.date=? AND r.venue_code=? AND r.race_no=?
               AND rre.rank IN (1,2,3) AND rre.boat_no IS NOT NULL
             ORDER BY rre.rank
