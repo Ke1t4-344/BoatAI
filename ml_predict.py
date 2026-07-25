@@ -167,14 +167,26 @@ def _load_models():
                 "avg_st": row[5] or COURSE_DEFAULT_AVG_ST.get(row[1], 0.20),
             }
 
-    # ── 重い集計データはJSONキャッシュから読む（TTL=6時間）──
-    # race_result_entries 全件スキャン×5 → キャッシュHITなら 0スキャン
+    # ── 重い集計データはJSONキャッシュから読む（TTL=24時間）──
+    # race_result_entries 全件スキャン×5 → キャッシュHITなら Turso reads = 0
     if not _load_stats_cache():
-        # キャッシュ期限切れ or 初回 → DB全件スキャン（重い処理）
-        print("[ml_predict] DB全スキャン開始（完了後6hキャッシュ）...")
+        # キャッシュ期限切れ or 初回 → 集計実行
+        # 重要: Turso は30秒タイムアウトのため、ローカルSQLiteで集計する
+        # （boatai.db はバックアップから最新に近い状態）
+        import sqlite3 as _sqlite3_local
+        _local_db = DB_PATH  # Path(__file__).parent / "boatai.db"
+
+        if _local_db.exists():
+            print(f"[ml_predict] ローカルSQLite集計開始: {_local_db}")
+            _lconn = _sqlite3_local.connect(str(_local_db), timeout=120)
+            _lconn.row_factory = _sqlite3_local.Row
+        else:
+            # ローカルDBなし（Railway等）→ Tursoで試みる（タイムアウトリスクあり）
+            print("[ml_predict] ローカルDBなし → Turso集計開始（タイムアウトに注意）")
+            _lconn = conn
 
         # ── 会場別1コース1着率 ──
-        rows = conn.execute("""
+        rows = _lconn.execute("""
             SELECT r.venue_code, COUNT(*) AS total,
                    SUM(CASE WHEN rre.rank=1 THEN 1 ELSE 0 END) AS wins
             FROM race_result_entries rre
@@ -187,7 +199,7 @@ def _load_models():
             _venue_c1[vc] = (wins / total * 100) if total >= 10 else 55.0
 
         # ── 選手別実績（race_result_entries 100%カバレッジ）──
-        ph_rows = conn.execute("""
+        ph_rows = _lconn.execute("""
             SELECT player_no,
                    COUNT(*) as n,
                    SUM(CASE WHEN rank=1 THEN 1.0 ELSE 0 END) as wins,
@@ -215,7 +227,7 @@ def _load_models():
             }
 
         # ── 選手×会場別実績 ──
-        pv_rows = conn.execute("""
+        pv_rows = _lconn.execute("""
             SELECT rre.player_no, r.venue_code, COUNT(*) as n,
                    SUM(CASE WHEN rre.rank=1 THEN 1.0 ELSE 0 END) as wins,
                    SUM(CASE WHEN rre.rank<=3 THEN 1.0 ELSE 0 END) as top3
@@ -235,7 +247,7 @@ def _load_models():
             }
 
         # ── 選手×コース別実績 ──
-        pc_rows = conn.execute("""
+        pc_rows = _lconn.execute("""
             SELECT player_no, start_course, COUNT(*) as n,
                    SUM(CASE WHEN rank=1 THEN 1.0 ELSE 0 END) as wins,
                    SUM(CASE WHEN rank<=3 THEN 1.0 ELSE 0 END) as top3,
@@ -258,7 +270,7 @@ def _load_models():
             }
 
         # ── 決まり手分布 ──
-        tk_rows = conn.execute("""
+        tk_rows = _lconn.execute("""
             SELECT player_no,
                    SUM(CASE WHEN rank=1 THEN 1.0 ELSE 0 END) as total_wins,
                    SUM(CASE WHEN winning_trick='逃げ'      AND rank=1 THEN 1.0 ELSE 0 END),
@@ -278,6 +290,13 @@ def _load_models():
                 "pct_sashi":       row[4] / total,
                 "pct_makurisashi": row[5] / total,
             }
+
+        # ローカルSQLite を使った場合はここでクローズ（Turso接続は別途閉じる）
+        if _lconn is not conn:
+            try:
+                _lconn.close()
+            except Exception:
+                pass
 
         _save_stats_cache()
 
