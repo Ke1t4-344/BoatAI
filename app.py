@@ -1071,10 +1071,19 @@ def get_races(date, venue_code):
 
 
 @st.cache_data(ttl=3600)
+def _predict_cached(date, venue_code, race_no):
+    """予想計算（成功時のみキャッシュ）。失敗時は例外をそのまま投げる。"""
+    return _predict(date, venue_code, race_no)
+
+
 def get_prediction(date, venue_code, race_no, model_mode="XGBoost ML"):
+    """予想取得。エラーはキャッシュしない（次回リトライ）。"""
     try:
-        return _predict(date, venue_code, race_no), None
+        return _predict_cached(date, venue_code, race_no), None
     except Exception as e:
+        import traceback
+        traceback.print_exc()           # app.log にスタックトレースを記録
+        _predict_cached.clear()         # エラーキャッシュをクリア → 次回リトライ可能
         return None, str(e)
 
 
