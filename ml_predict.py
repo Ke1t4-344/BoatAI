@@ -15,6 +15,7 @@ import json
 import itertools
 import pickle
 import math
+import threading
 from pathlib import Path
 from datetime import datetime
 from typing import Optional
@@ -45,6 +46,7 @@ _player_venue_hist:  dict = {}   # (player_no, venue_code) → {win_rate, top3_r
 _player_course_hist: dict = {}   # (player_no, course_no) → {win_rate, top3_rate, avg_st}
 _trick_hist:         dict = {}   # player_no → {pct_nige, pct_makuri, pct_sashi, pct_makurisashi}
 _cache_ready = False
+_load_lock   = threading.Lock()  # _load_models() スレッドセーフ化
 
 
 def _parse_st(val) -> Optional[float]:
@@ -125,186 +127,208 @@ def _load_models():
     """モデルと全共通データをメモリにロード（初回のみ）
 
     重い集計クエリ（race_result_entries全件スキャン×5）は
-    ml_stats_cache.json に 6時間キャッシュし、Turso read を大幅削減する。
+    ml_stats_cache.json に 24時間キャッシュし、Turso read を大幅削減する。
+    threading.Lock で複数スレッドが同時に実行しないよう保護している。
     """
     global _models, _feature_cols, _cs_map, _venue_c1
     global _player_hist, _player_venue_hist, _player_course_hist, _trick_hist
     global _cache_ready
     if _cache_ready:
         return
+    with _load_lock:
+        # ロック取得後に再チェック（他スレッドが先に完了している場合はスキップ）
+        if _cache_ready:
+            return
 
-    # ── XGBoostモデル（pickleファイル、ローカル読み込み）──
-    for target in ["is_1st", "is_2nd", "is_3rd"]:
-        p = MODELS_DIR / f"xgb_{target}.pkl"
-        if not p.exists():
-            raise FileNotFoundError(
-                f"モデルが見つかりません: {p}\n"
-                "先に ml_pipeline.py --step all を実行してください。"
-            )
-        with open(p, "rb") as f:
-            _models[target] = pickle.load(f)
+        # ── XGBoostモデル（pickleファイル、ローカル読み込み）──
+        for target in ["is_1st", "is_2nd", "is_3rd"]:
+            p = MODELS_DIR / f"xgb_{target}.pkl"
+            if not p.exists():
+                raise FileNotFoundError(
+                    f"モデルが見つかりません: {p}\n"
+                    "先に ml_pipeline.py --step all を実行してください。"
+                )
+            with open(p, "rb") as f:
+                _models[target] = pickle.load(f)
 
-    with open(MODELS_DIR / "feature_cols.json") as f:
-        _feature_cols = json.load(f)
+        with open(MODELS_DIR / "feature_cols.json") as f:
+            _feature_cols = json.load(f)
 
-    from db_connect import open_db as _open_db, USE_TURSO as _USE_TURSO_LM
-    print(f"[ml_predict] _load_models: USE_TURSO={_USE_TURSO_LM}", flush=True)
-    conn = _open_db()
-    print(f"[ml_predict] _load_models: conn type={type(conn).__name__}", flush=True)
+        from db_connect import open_db as _open_db, USE_TURSO as _USE_TURSO_LM
+        print(f"[ml_predict] _load_models: USE_TURSO={_USE_TURSO_LM}", flush=True)
+        conn = _open_db()
+        print(f"[ml_predict] _load_models: conn type={type(conn).__name__}", flush=True)
 
-    # ── course_stats（公式ウェブ取得・件数少ないので毎回OK）──
-    rows = conn.execute("""
-        SELECT player_no, course_no, win_rate_1st, win_rate_2nd, win_rate_3rd, avg_st
-        FROM course_stats ORDER BY fetched_date DESC
-    """).fetchall()
-    for row in rows:
-        key = (row[0], row[1])
-        if key not in _cs_map:
-            t1 = row[2] or 0.0
-            t2 = row[3] or 0.0
-            t3 = row[4] or 0.0
-            _cs_map[key] = {
-                "top1":   t1 if t1 > 0 else COURSE_DEFAULT_WIN_RATE.get(row[1], 8.0),
-                "top3":   t2 + t3,
-                "avg_st": row[5] or COURSE_DEFAULT_AVG_ST.get(row[1], 0.20),
-            }
-
-    # ── 重い集計データはJSONキャッシュから読む（TTL=24時間）──
-    # race_result_entries 全件スキャン×5 → キャッシュHITなら Turso reads = 0
-    if not _load_stats_cache():
-        # キャッシュ期限切れ or 初回 → 集計実行
-        # 重要: Turso は30秒タイムアウトのため、ローカルSQLiteで集計する
-        # （boatai.db はバックアップから最新に近い状態）
-        import sqlite3 as _sqlite3_local
-        _local_db = DB_PATH  # Path(__file__).parent / "boatai.db"
-
-        if _local_db.exists():
-            print(f"[ml_predict] ローカルSQLite集計開始: {_local_db}")
-            _lconn = _sqlite3_local.connect(str(_local_db), timeout=120)
-            _lconn.row_factory = _sqlite3_local.Row
-        else:
-            # ローカルDBなし（Railway等）→ Tursoで試みる（タイムアウトリスクあり）
-            print("[ml_predict] ローカルDBなし → Turso集計開始（タイムアウトに注意）")
-            _lconn = conn
-
-        # ── 会場別1コース1着率 ──
-        rows = _lconn.execute("""
-            SELECT r.venue_code, COUNT(*) AS total,
-                   SUM(CASE WHEN rre.rank=1 THEN 1 ELSE 0 END) AS wins
-            FROM race_result_entries rre
-            JOIN races r ON r.id = rre.race_id
-            WHERE rre.start_course = 1
-            GROUP BY r.venue_code
+        # ── course_stats（公式ウェブ取得・件数少ないので毎回OK）──
+        rows = conn.execute("""
+            SELECT player_no, course_no, win_rate_1st, win_rate_2nd, win_rate_3rd, avg_st
+            FROM course_stats ORDER BY fetched_date DESC
         """).fetchall()
         for row in rows:
-            vc, total, wins = row[0], row[1], row[2]
-            _venue_c1[vc] = (wins / total * 100) if total >= 10 else 55.0
+            key = (row[0], row[1])
+            if key not in _cs_map:
+                t1 = row[2] or 0.0
+                t2 = row[3] or 0.0
+                t3 = row[4] or 0.0
+                _cs_map[key] = {
+                    "top1":   t1 if t1 > 0 else COURSE_DEFAULT_WIN_RATE.get(row[1], 8.0),
+                    "top3":   t2 + t3,
+                    "avg_st": row[5] or COURSE_DEFAULT_AVG_ST.get(row[1], 0.20),
+                }
 
-        # ── 選手別実績（race_result_entries 100%カバレッジ）──
-        ph_rows = _lconn.execute("""
-            SELECT player_no,
-                   COUNT(*) as n,
-                   SUM(CASE WHEN rank=1 THEN 1.0 ELSE 0 END) as wins,
-                   SUM(CASE WHEN rank<=3 THEN 1.0 ELSE 0 END) as top3,
-                   AVG(CAST(start_timing AS REAL)) as avg_st,
-                   SUM(CAST(start_timing AS REAL)*CAST(start_timing AS REAL)) as st_sq_sum
-            FROM race_result_entries
-            WHERE player_no IS NOT NULL AND rank IS NOT NULL
-              AND CAST(start_timing AS REAL) BETWEEN -0.5 AND 1.0
-            GROUP BY player_no
-        """).fetchall()
-        for row in ph_rows:
-            n = row[1]
-            if n < 10:
-                continue
-            avg_st = float(row[4] or 0.18)
-            st_sq_mean = float(row[5] or 0) / n
-            st_var = max(0.0, st_sq_mean - avg_st ** 2)
-            _player_hist[row[0]] = {
-                "win_rate":   row[2] / n,
-                "top3_rate":  row[3] / n,
-                "avg_st":     avg_st,
-                "st_std":     st_var ** 0.5,
-                "race_count": n,
-            }
+        # ── 重い集計データはJSONキャッシュから読む（TTL=24時間）──
+        # race_result_entries 全件スキャン×5 → キャッシュHITなら Turso reads = 0
+        if not _load_stats_cache():
+            # キャッシュ期限切れ or 初回 → 集計実行
+            # 重要: Turso は30秒タイムアウトのため、ローカルSQLiteで集計する
+            # （boatai.db はバックアップから最新に近い状態）
+            import sqlite3 as _sqlite3_local
+            _local_db = DB_PATH  # Path(__file__).parent / "boatai.db"
 
-        # ── 選手×会場別実績 ──
-        pv_rows = _lconn.execute("""
-            SELECT rre.player_no, r.venue_code, COUNT(*) as n,
-                   SUM(CASE WHEN rre.rank=1 THEN 1.0 ELSE 0 END) as wins,
-                   SUM(CASE WHEN rre.rank<=3 THEN 1.0 ELSE 0 END) as top3
-            FROM race_result_entries rre
-            JOIN races r ON r.id = rre.race_id
-            WHERE rre.player_no IS NOT NULL AND rre.rank IS NOT NULL
-            GROUP BY rre.player_no, r.venue_code
-        """).fetchall()
-        for row in pv_rows:
-            n = row[2]
-            if n < 5:
-                continue
-            _player_venue_hist[(row[0], row[1])] = {
-                "win_rate":   row[3] / n,
-                "top3_rate":  row[4] / n,
-                "race_count": n,
-            }
+            _lconn = None
+            if _local_db.exists():
+                try:
+                    print(f"[ml_predict] ローカルSQLite集計開始: {_local_db}", flush=True)
+                    _lconn = _sqlite3_local.connect(str(_local_db), timeout=120)
+                    _lconn.row_factory = _sqlite3_local.Row
+                except Exception as _e:
+                    print(f"[ml_predict] ローカルSQLite接続失敗: {_e} → Turso fallback", flush=True)
+                    _lconn = None
 
-        # ── 選手×コース別実績 ──
-        pc_rows = _lconn.execute("""
-            SELECT player_no, start_course, COUNT(*) as n,
-                   SUM(CASE WHEN rank=1 THEN 1.0 ELSE 0 END) as wins,
-                   SUM(CASE WHEN rank<=3 THEN 1.0 ELSE 0 END) as top3,
-                   AVG(CAST(start_timing AS REAL)) as avg_st
-            FROM race_result_entries
-            WHERE player_no IS NOT NULL AND rank IS NOT NULL
-              AND start_course BETWEEN 1 AND 6
-              AND CAST(start_timing AS REAL) BETWEEN -0.5 AND 1.0
-            GROUP BY player_no, start_course
-        """).fetchall()
-        for row in pc_rows:
-            n = row[2]
-            if n < 5:
-                continue
-            _player_course_hist[(row[0], row[1])] = {
-                "win_rate":   row[3] / n,
-                "top3_rate":  row[4] / n,
-                "avg_st":     float(row[5] or 0.18),
-                "race_count": n,
-            }
+            if _lconn is None:
+                # ローカルDBなし or 接続失敗 → Tursoで試みる（タイムアウトリスクあり）
+                print("[ml_predict] Turso集計開始（タイムアウトに注意）", flush=True)
+                _lconn = conn
 
-        # ── 決まり手分布 ──
-        tk_rows = _lconn.execute("""
-            SELECT player_no,
-                   SUM(CASE WHEN rank=1 THEN 1.0 ELSE 0 END) as total_wins,
-                   SUM(CASE WHEN winning_trick='逃げ'      AND rank=1 THEN 1.0 ELSE 0 END),
-                   SUM(CASE WHEN winning_trick='まくり'    AND rank=1 THEN 1.0 ELSE 0 END),
-                   SUM(CASE WHEN winning_trick='差し'      AND rank=1 THEN 1.0 ELSE 0 END),
-                   SUM(CASE WHEN winning_trick='まくり差し' AND rank=1 THEN 1.0 ELSE 0 END)
-            FROM race_result_entries
-            WHERE player_no IS NOT NULL AND winning_trick IS NOT NULL
-            GROUP BY player_no
-            HAVING total_wins >= 3
-        """).fetchall()
-        for row in tk_rows:
-            total = row[1] or 1
-            _trick_hist[row[0]] = {
-                "pct_nige":        row[2] / total,
-                "pct_makuri":      row[3] / total,
-                "pct_sashi":       row[4] / total,
-                "pct_makurisashi": row[5] / total,
-            }
-
-        # ローカルSQLite を使った場合はここでクローズ（Turso接続は別途閉じる）
-        if _lconn is not conn:
             try:
-                _lconn.close()
-            except Exception:
-                pass
+                # ── 会場別1コース1着率 ──
+                rows = _lconn.execute("""
+                    SELECT r.venue_code, COUNT(*) AS total,
+                           SUM(CASE WHEN rre.rank=1 THEN 1 ELSE 0 END) AS wins
+                    FROM race_result_entries rre
+                    JOIN races r ON r.id = rre.race_id
+                    WHERE rre.start_course = 1
+                    GROUP BY r.venue_code
+                """).fetchall()
+                for row in rows:
+                    vc, total, wins = row[0], row[1], row[2]
+                    _venue_c1[vc] = (wins / total * 100) if total >= 10 else 55.0
 
-        _save_stats_cache()
+                # ── 選手別実績（race_result_entries 100%カバレッジ）──
+                ph_rows = _lconn.execute("""
+                    SELECT player_no,
+                           COUNT(*) as n,
+                           SUM(CASE WHEN rank=1 THEN 1.0 ELSE 0 END) as wins,
+                           SUM(CASE WHEN rank<=3 THEN 1.0 ELSE 0 END) as top3,
+                           AVG(CAST(start_timing AS REAL)) as avg_st,
+                           SUM(CAST(start_timing AS REAL)*CAST(start_timing AS REAL)) as st_sq_sum
+                    FROM race_result_entries
+                    WHERE player_no IS NOT NULL AND rank IS NOT NULL
+                      AND CAST(start_timing AS REAL) BETWEEN -0.5 AND 1.0
+                    GROUP BY player_no
+                """).fetchall()
+                for row in ph_rows:
+                    n = row[1]
+                    if n < 10:
+                        continue
+                    avg_st = float(row[4] or 0.18)
+                    st_sq_mean = float(row[5] or 0) / n
+                    st_var = max(0.0, st_sq_mean - avg_st ** 2)
+                    _player_hist[row[0]] = {
+                        "win_rate":   row[2] / n,
+                        "top3_rate":  row[3] / n,
+                        "avg_st":     avg_st,
+                        "st_std":     st_var ** 0.5,
+                        "race_count": n,
+                    }
 
-    conn.close()
-    _cache_ready = True
-    print(f"[ml_predict] モデルロード完了: {len(_player_hist):,}選手の実績データ")
+                # ── 選手×会場別実績 ──
+                pv_rows = _lconn.execute("""
+                    SELECT rre.player_no, r.venue_code, COUNT(*) as n,
+                           SUM(CASE WHEN rre.rank=1 THEN 1.0 ELSE 0 END) as wins,
+                           SUM(CASE WHEN rre.rank<=3 THEN 1.0 ELSE 0 END) as top3
+                    FROM race_result_entries rre
+                    JOIN races r ON r.id = rre.race_id
+                    WHERE rre.player_no IS NOT NULL AND rre.rank IS NOT NULL
+                    GROUP BY rre.player_no, r.venue_code
+                """).fetchall()
+                for row in pv_rows:
+                    n = row[2]
+                    if n < 5:
+                        continue
+                    _player_venue_hist[(row[0], row[1])] = {
+                        "win_rate":   row[3] / n,
+                        "top3_rate":  row[4] / n,
+                        "race_count": n,
+                    }
+
+                # ── 選手×コース別実績 ──
+                pc_rows = _lconn.execute("""
+                    SELECT player_no, start_course, COUNT(*) as n,
+                           SUM(CASE WHEN rank=1 THEN 1.0 ELSE 0 END) as wins,
+                           SUM(CASE WHEN rank<=3 THEN 1.0 ELSE 0 END) as top3,
+                           AVG(CAST(start_timing AS REAL)) as avg_st
+                    FROM race_result_entries
+                    WHERE player_no IS NOT NULL AND rank IS NOT NULL
+                      AND start_course BETWEEN 1 AND 6
+                      AND CAST(start_timing AS REAL) BETWEEN -0.5 AND 1.0
+                    GROUP BY player_no, start_course
+                """).fetchall()
+                for row in pc_rows:
+                    n = row[2]
+                    if n < 5:
+                        continue
+                    _player_course_hist[(row[0], row[1])] = {
+                        "win_rate":   row[3] / n,
+                        "top3_rate":  row[4] / n,
+                        "avg_st":     float(row[5] or 0.18),
+                        "race_count": n,
+                    }
+
+                # ── 決まり手分布 ──
+                tk_rows = _lconn.execute("""
+                    SELECT player_no,
+                           SUM(CASE WHEN rank=1 THEN 1.0 ELSE 0 END) as total_wins,
+                           SUM(CASE WHEN winning_trick='逃げ'      AND rank=1 THEN 1.0 ELSE 0 END),
+                           SUM(CASE WHEN winning_trick='まくり'    AND rank=1 THEN 1.0 ELSE 0 END),
+                           SUM(CASE WHEN winning_trick='差し'      AND rank=1 THEN 1.0 ELSE 0 END),
+                           SUM(CASE WHEN winning_trick='まくり差し' AND rank=1 THEN 1.0 ELSE 0 END)
+                    FROM race_result_entries
+                    WHERE player_no IS NOT NULL AND winning_trick IS NOT NULL
+                    GROUP BY player_no
+                    HAVING total_wins >= 3
+                """).fetchall()
+                for row in tk_rows:
+                    total = row[1] or 1
+                    _trick_hist[row[0]] = {
+                        "pct_nige":        row[2] / total,
+                        "pct_makuri":      row[3] / total,
+                        "pct_sashi":       row[4] / total,
+                        "pct_makurisashi": row[5] / total,
+                    }
+
+                # ローカルSQLite を使った場合はここでクローズ（Turso接続は別途閉じる）
+                if _lconn is not conn:
+                    try:
+                        _lconn.close()
+                    except Exception:
+                        pass
+
+                _save_stats_cache()
+
+            except Exception as _agg_err:
+                # 集計失敗してもモデル自体は使えるのでエラーを飲み込む
+                # デフォルト値（空dict）のまま予測を続行する
+                print(f"[ml_predict] 統計集計失敗（デフォルト値で続行）: {_agg_err}", flush=True)
+                if _lconn is not None and _lconn is not conn:
+                    try:
+                        _lconn.close()
+                    except Exception:
+                        pass
+
+        conn.close()
+        _cache_ready = True
+        print(f"[ml_predict] モデルロード完了: {len(_player_hist):,}選手の実績データ", flush=True)
 
 
 def _build_boat_features(boat_no: int, pno, row_entries, venue_code: str,
@@ -773,6 +797,7 @@ def predict_ml(date: str, venue_code: str, race_no: int, conn=None) -> dict:
         ev_recs = sorted(ev_recs, key=lambda x: x["ev"] or 0, reverse=True)[:20]
         ev_recs_detail = [dict(rank=i+1, **c) for i, c in enumerate(ev_recs)]
 
+        _dbg("predict_ml SUCCESS")
         return {
             "model":                 "xgboost_v2",
             # predict.py 互換キー
@@ -791,6 +816,9 @@ def predict_ml(date: str, venue_code: str, race_no: int, conn=None) -> dict:
             "confidence":            float(top_boat["prob_1st"]),
         }
 
+    except Exception as _ex:
+        _dbg(f"predict_ml FAILED: {_ex}")
+        raise
     finally:
         if _own_conn:
             conn.close()
