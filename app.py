@@ -960,7 +960,7 @@ def get_meet_day(date: str, venue_code: str) -> int:
     return day_num
 
 
-@st.cache_data(ttl=60)
+@st.cache_data(ttl=300)
 def get_venues(date):
     """
     指定日の開催会場一覧を返す。
@@ -978,12 +978,12 @@ def get_venues(date):
             venue_races.setdefault(r["venue_code"], []).append(r["id"])
 
         result_ids = {r[0] for r in c.execute(
-            "SELECT DISTINCT rre.race_id FROM race_result_entries rre "
-            "JOIN races r ON r.id = rre.race_id WHERE r.date=?", (date,)
+            "SELECT DISTINCT rre.race_id FROM races r "
+            "JOIN race_result_entries rre ON rre.race_id = r.id WHERE r.date=?", (date,)
         ).fetchall()}
         bi_ids = {r[0] for r in c.execute(
-            "SELECT DISTINCT bi.race_id FROM before_info bi "
-            "JOIN races r ON r.id = bi.race_id "
+            "SELECT DISTINCT bi.race_id FROM races r "
+            "JOIN before_info bi ON bi.race_id = r.id "
             "WHERE bi.exhibition_time IS NOT NULL AND r.date=?", (date,)
         ).fetchall()}
         venue_map = {r[0]: r[1] for r in c.execute(
@@ -1030,7 +1030,7 @@ def get_venues(date):
     ]
 
 
-@st.cache_data(ttl=30)
+@st.cache_data(ttl=120)
 def get_races(date, venue_code):
     """
     指定日・会場のレース一覧を返す。
@@ -1045,13 +1045,14 @@ def get_races(date, venue_code):
         if not races:
             return []
         result_ids = {r[0] for r in c.execute(
-            "SELECT DISTINCT rre.race_id FROM race_result_entries rre "
-            "JOIN races r ON r.id = rre.race_id WHERE r.date=? AND r.venue_code=?",
+            "SELECT DISTINCT rre.race_id FROM races r "
+            "JOIN race_result_entries rre ON rre.race_id = r.id "
+            "WHERE r.date=? AND r.venue_code=?",
             (date, venue_code)
         ).fetchall()}
         bi_ids = {r[0] for r in c.execute(
-            "SELECT DISTINCT bi.race_id FROM before_info bi "
-            "JOIN races r ON r.id = bi.race_id "
+            "SELECT DISTINCT bi.race_id FROM races r "
+            "JOIN before_info bi ON bi.race_id = r.id "
             "WHERE bi.exhibition_time IS NOT NULL AND r.date=? AND r.venue_code=?",
             (date, venue_code)
         ).fetchall()}
@@ -1092,8 +1093,8 @@ def get_result(date, venue_code, race_no):
     with _conn() as c:
         rows = c.execute("""
             SELECT rre.rank, rre.boat_no, rre.player_name, rre.start_timing
-            FROM race_result_entries rre
-            JOIN races r ON r.id = rre.race_id
+            FROM races r
+            JOIN race_result_entries rre ON rre.race_id = r.id
             WHERE r.date=? AND r.venue_code=? AND r.race_no=? ORDER BY rre.rank
         """, (date, venue_code, race_no)).fetchall()
         payout_row = c.execute("""
@@ -1819,8 +1820,8 @@ def get_payout_summary(date):
         payout_map = {r["race_id"]: {"combination": r["combination"], "payout": r["payout"]}
                       for r in payouts_raw}
         results_raw = c.execute(
-            "SELECT rre.race_id, rre.boat_no, rre.rank FROM race_result_entries rre "
-            "JOIN races r ON r.id = rre.race_id "
+            "SELECT rre.race_id, rre.boat_no, rre.rank FROM races r "
+            "JOIN race_result_entries rre ON rre.race_id = r.id "
             "WHERE rre.rank <= 3 AND r.date=? ORDER BY rre.race_id, rre.rank", (date,)
         ).fetchall()
         results_map = {}
@@ -3963,8 +3964,8 @@ def show_history():
         if race_ids:
             all_results_raw = c.execute(
                 "SELECT rre.race_id, rre.rank, rre.boat_no, rre.player_name, rre.start_timing "
-                "FROM race_result_entries rre "
-                "JOIN races r ON r.id = rre.race_id "
+                "FROM races r "
+                "JOIN race_result_entries rre ON rre.race_id = r.id "
                 "WHERE r.date=? AND r.venue_code=? ORDER BY rre.race_id, rre.rank",
                 (sel_date, sel_vc)
             ).fetchall()

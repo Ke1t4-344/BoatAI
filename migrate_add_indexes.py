@@ -27,6 +27,17 @@ INDEXES = [
     ("idx_rre_start_course",
      "CREATE INDEX IF NOT EXISTS idx_rre_start_course ON race_result_entries(start_course)"),
 
+    # race_id でフィルタ: app.pyの全JOIN操作（get_venues/get_races/get_result/get_payout_summary）
+    # race_result_entries は race_id に外部インデックスが存在しないため全1.8Mスキャン発生
+    # → このインデックスでJOIN操作を O(1.8M) → O(log 1.8M) に削減
+    ("idx_rre_race_id",
+     "CREATE INDEX IF NOT EXISTS idx_rre_race_id ON race_result_entries(race_id)"),
+
+    # (race_id, rank) 複合インデックス: show_detail()の自己JOIN w.race_id=me.race_id AND w.rank=1
+    # idx_rre_race_id のみだとrankフィルタで追加スキャンが発生。複合インデックスで一点検索に変換
+    ("idx_rre_race_rank",
+     "CREATE INDEX IF NOT EXISTS idx_rre_race_rank ON race_result_entries(race_id, rank)"),
+
     # ── entries (186万行) ─────────────────────────────────────────────
     # motor_no でフィルタ: ml_predict.py meet_motor_stats
     ("idx_entries_motor_no",
