@@ -147,8 +147,10 @@ def _load_models():
     with open(MODELS_DIR / "feature_cols.json") as f:
         _feature_cols = json.load(f)
 
-    from db_connect import open_db as _open_db
+    from db_connect import open_db as _open_db, USE_TURSO as _USE_TURSO_LM
+    print(f"[ml_predict] _load_models: USE_TURSO={_USE_TURSO_LM}", flush=True)
     conn = _open_db()
+    print(f"[ml_predict] _load_models: conn type={type(conn).__name__}", flush=True)
 
     # ── course_stats（公式ウェブ取得・件数少ないので毎回OK）──
     rows = conn.execute("""
@@ -473,15 +475,31 @@ def predict_ml(date: str, venue_code: str, race_no: int, conn=None) -> dict:
     """
     import pandas as pd
 
+    # ── デバッグログ（原因調査用）──
+    _dbg_log = MODELS_DIR.parent / "logs" / "predict_debug.log"
+    def _dbg(msg):
+        try:
+            with open(_dbg_log, "a", encoding="utf-8") as _f:
+                import datetime as _dt
+                _f.write(f"[{_dt.datetime.now():%H:%M:%S}] {msg}\n")
+                _f.flush()
+        except Exception:
+            pass
+
+    _dbg(f"predict_ml START date={date} vc={venue_code} rno={race_no} conn={type(conn).__name__}")
+
     _load_models()
+    _dbg(f"_load_models done, _cache_ready={_cache_ready}")
 
     _own_conn = conn is None
     if _own_conn:
-        from db_connect import open_db as _open_db
+        from db_connect import open_db as _open_db, USE_TURSO as _USE_TURSO, DB_PATH as _db_path
         conn = _open_db()
+        _dbg(f"opened conn: USE_TURSO={_USE_TURSO} type={type(conn).__name__} DB_PATH={_db_path}")
 
     try:
         # ── レースID・タイトル取得 ──
+        _dbg("query: races")
         row = conn.execute(
             "SELECT id, race_title FROM races WHERE date=? AND venue_code=? AND race_no=?",
             (date, venue_code, race_no)
@@ -490,8 +508,10 @@ def predict_ml(date: str, venue_code: str, race_no: int, conn=None) -> dict:
             raise ValueError(f"Race not found: {date} {venue_code} {race_no}R")
         race_id    = row[0]
         race_title = row[1] or ""
+        _dbg(f"race_id={race_id}")
 
         # ── entries 取得 ──
+        _dbg("query: entries")
         entries = conn.execute("""
             SELECT boat_no, player_no, player_class, age, weight,
                    flying_count, late_count, avg_start_timing,
@@ -526,6 +546,7 @@ def predict_ml(date: str, venue_code: str, race_no: int, conn=None) -> dict:
 
         meet_motor_stats: dict = {}
         if _mno_list:
+            _dbg("query: meet_motor_stats (race_result_entries JOIN)")
             _mno_ph = ",".join("?" * len(_mno_list))
             for _mr in conn.execute(f"""
                 SELECT e2.motor_no,
@@ -552,6 +573,7 @@ def predict_ml(date: str, venue_code: str, race_no: int, conn=None) -> dict:
         _pno_list_ml = [(r[0], r[1]) for r in entries if r[1]]
         meet_player_stats: dict = {}
         if _pno_list_ml:
+            _dbg("query: meet_player_stats (race_result_entries direct)")
             _pno_ph_ml = ",".join("?" * len(_pno_list_ml))
             _pnos_ml = [p for _, p in _pno_list_ml]
             _pm_map: dict = {}
