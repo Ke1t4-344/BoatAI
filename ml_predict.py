@@ -60,15 +60,80 @@ def _parse_st(val) -> Optional[float]:
         return None
 
 
+_STATS_CACHE_PATH = MODELS_DIR / "ml_stats_cache.json"
+_STATS_CACHE_TTL  = 24 * 3600  # 24時間（秒）— 歴史的集計は1日スケールでしか変わらない
+
+
+def _save_stats_cache():
+    """集計済み統計データをJSONファイルに保存（次回起動時に再利用）"""
+    import time
+    data = {
+        "_ts": time.time(),
+        "_venue_c1": _venue_c1,
+        "_player_hist": _player_hist,
+        # tupleキー → "pno:vc" 形式の文字列に変換
+        "_player_venue_hist": {f"{k[0]}:{k[1]}": v for k, v in _player_venue_hist.items()},
+        "_player_course_hist": {f"{k[0]}:{k[1]}": v for k, v in _player_course_hist.items()},
+        "_trick_hist": _trick_hist,
+    }
+    try:
+        _STATS_CACHE_PATH.write_text(
+            json.dumps(data, ensure_ascii=False, separators=(",", ":")),
+            encoding="utf-8"
+        )
+    except Exception as e:
+        print(f"[ml_predict] stats cache書き込み失敗（無視）: {e}")
+
+
+def _load_stats_cache() -> bool:
+    """
+    JSONキャッシュが存在かつ TTL 以内なら読み込んでTrueを返す。
+    古い・壊れている場合はFalseを返す（→ DB再スキャンへ）
+    """
+    import time
+    global _venue_c1, _player_hist, _player_venue_hist, _player_course_hist, _trick_hist
+
+    if not _STATS_CACHE_PATH.exists():
+        return False
+    try:
+        text = _STATS_CACHE_PATH.read_text(encoding="utf-8")
+        data = json.loads(text)
+        age = time.time() - float(data.get("_ts", 0))
+        if age > _STATS_CACHE_TTL:
+            print(f"[ml_predict] statsキャッシュ期限切れ ({age/3600:.1f}h) → DB再スキャン")
+            return False
+        _venue_c1             = data["_venue_c1"]
+        _player_hist          = data["_player_hist"]
+        _player_venue_hist    = {
+            tuple(k.split(":", 1)): v
+            for k, v in data["_player_venue_hist"].items()
+        }
+        _player_course_hist   = {
+            (k.split(":", 1)[0], int(k.split(":", 1)[1])): v
+            for k, v in data["_player_course_hist"].items()
+        }
+        _trick_hist           = data["_trick_hist"]
+        print(f"[ml_predict] statsキャッシュ利用 (age={age/3600:.1f}h, "
+              f"{len(_player_hist):,}選手) — Turso read 節約")
+        return True
+    except Exception as e:
+        print(f"[ml_predict] statsキャッシュ読み込み失敗 ({e}) → DB再スキャン")
+        return False
+
+
 def _load_models():
-    """モデルと全共通データをメモリにロード（初回のみ）"""
+    """モデルと全共通データをメモリにロード（初回のみ）
+
+    重い集計クエリ（race_result_entries全件スキャン×5）は
+    ml_stats_cache.json に 6時間キャッシュし、Turso read を大幅削減する。
+    """
     global _models, _feature_cols, _cs_map, _venue_c1
     global _player_hist, _player_venue_hist, _player_course_hist, _trick_hist
     global _cache_ready
     if _cache_ready:
         return
 
-    # ── XGBoostモデル ──
+    # ── XGBoostモデル（pickleファイル、ローカル読み込み）──
     for target in ["is_1st", "is_2nd", "is_3rd"]:
         p = MODELS_DIR / f"xgb_{target}.pkl"
         if not p.exists():
@@ -85,7 +150,7 @@ def _load_models():
     from db_connect import open_db as _open_db
     conn = _open_db()
 
-    # ── course_stats（公式ウェブ取得） ──
+    # ── course_stats（公式ウェブ取得・件数少ないので毎回OK）──
     rows = conn.execute("""
         SELECT player_no, course_no, win_rate_1st, win_rate_2nd, win_rate_3rd, avg_st
         FROM course_stats ORDER BY fetched_date DESC
@@ -102,111 +167,119 @@ def _load_models():
                 "avg_st": row[5] or COURSE_DEFAULT_AVG_ST.get(row[1], 0.20),
             }
 
-    # ── 会場別1コース1着率 ──
-    rows = conn.execute("""
-        SELECT r.venue_code, COUNT(*) AS total,
-               SUM(CASE WHEN rre.rank=1 THEN 1 ELSE 0 END) AS wins
-        FROM race_result_entries rre
-        JOIN races r ON r.id = rre.race_id
-        WHERE rre.start_course = 1
-        GROUP BY r.venue_code
-    """).fetchall()
-    for row in rows:
-        vc, total, wins = row[0], row[1], row[2]
-        _venue_c1[vc] = (wins / total * 100) if total >= 10 else 55.0
+    # ── 重い集計データはJSONキャッシュから読む（TTL=6時間）──
+    # race_result_entries 全件スキャン×5 → キャッシュHITなら 0スキャン
+    if not _load_stats_cache():
+        # キャッシュ期限切れ or 初回 → DB全件スキャン（重い処理）
+        print("[ml_predict] DB全スキャン開始（完了後6hキャッシュ）...")
 
-    # ── 選手別実績（race_result_entries 100%カバレッジ） ──
-    ph_rows = conn.execute("""
-        SELECT player_no,
-               COUNT(*) as n,
-               SUM(CASE WHEN rank=1 THEN 1.0 ELSE 0 END) as wins,
-               SUM(CASE WHEN rank<=3 THEN 1.0 ELSE 0 END) as top3,
-               AVG(CAST(start_timing AS REAL)) as avg_st,
-               SUM(CAST(start_timing AS REAL)*CAST(start_timing AS REAL)) as st_sq_sum
-        FROM race_result_entries
-        WHERE player_no IS NOT NULL AND rank IS NOT NULL
-          AND CAST(start_timing AS REAL) BETWEEN -0.5 AND 1.0
-        GROUP BY player_no
-    """).fetchall()
-    for row in ph_rows:
-        n = row[1]
-        if n < 10:
-            continue
-        avg_st = float(row[4] or 0.18)
-        st_sq_mean = float(row[5] or 0) / n
-        st_var = max(0.0, st_sq_mean - avg_st ** 2)
-        _player_hist[row[0]] = {
-            "win_rate":   row[2] / n,
-            "top3_rate":  row[3] / n,
-            "avg_st":     avg_st,
-            "st_std":     st_var ** 0.5,
-            "race_count": n,
-        }
+        # ── 会場別1コース1着率 ──
+        rows = conn.execute("""
+            SELECT r.venue_code, COUNT(*) AS total,
+                   SUM(CASE WHEN rre.rank=1 THEN 1 ELSE 0 END) AS wins
+            FROM race_result_entries rre
+            JOIN races r ON r.id = rre.race_id
+            WHERE rre.start_course = 1
+            GROUP BY r.venue_code
+        """).fetchall()
+        for row in rows:
+            vc, total, wins = row[0], row[1], row[2]
+            _venue_c1[vc] = (wins / total * 100) if total >= 10 else 55.0
 
-    # ── 選手×会場別実績 ──
-    pv_rows = conn.execute("""
-        SELECT rre.player_no, r.venue_code, COUNT(*) as n,
-               SUM(CASE WHEN rre.rank=1 THEN 1.0 ELSE 0 END) as wins,
-               SUM(CASE WHEN rre.rank<=3 THEN 1.0 ELSE 0 END) as top3
-        FROM race_result_entries rre
-        JOIN races r ON r.id = rre.race_id
-        WHERE rre.player_no IS NOT NULL AND rre.rank IS NOT NULL
-        GROUP BY rre.player_no, r.venue_code
-    """).fetchall()
-    for row in pv_rows:
-        n = row[2]
-        if n < 5:
-            continue
-        _player_venue_hist[(row[0], row[1])] = {
-            "win_rate":   row[3] / n,
-            "top3_rate":  row[4] / n,
-            "race_count": n,
-        }
+        # ── 選手別実績（race_result_entries 100%カバレッジ）──
+        ph_rows = conn.execute("""
+            SELECT player_no,
+                   COUNT(*) as n,
+                   SUM(CASE WHEN rank=1 THEN 1.0 ELSE 0 END) as wins,
+                   SUM(CASE WHEN rank<=3 THEN 1.0 ELSE 0 END) as top3,
+                   AVG(CAST(start_timing AS REAL)) as avg_st,
+                   SUM(CAST(start_timing AS REAL)*CAST(start_timing AS REAL)) as st_sq_sum
+            FROM race_result_entries
+            WHERE player_no IS NOT NULL AND rank IS NOT NULL
+              AND CAST(start_timing AS REAL) BETWEEN -0.5 AND 1.0
+            GROUP BY player_no
+        """).fetchall()
+        for row in ph_rows:
+            n = row[1]
+            if n < 10:
+                continue
+            avg_st = float(row[4] or 0.18)
+            st_sq_mean = float(row[5] or 0) / n
+            st_var = max(0.0, st_sq_mean - avg_st ** 2)
+            _player_hist[row[0]] = {
+                "win_rate":   row[2] / n,
+                "top3_rate":  row[3] / n,
+                "avg_st":     avg_st,
+                "st_std":     st_var ** 0.5,
+                "race_count": n,
+            }
 
-    # ── 選手×コース別実績 ──
-    pc_rows = conn.execute("""
-        SELECT player_no, start_course, COUNT(*) as n,
-               SUM(CASE WHEN rank=1 THEN 1.0 ELSE 0 END) as wins,
-               SUM(CASE WHEN rank<=3 THEN 1.0 ELSE 0 END) as top3,
-               AVG(CAST(start_timing AS REAL)) as avg_st
-        FROM race_result_entries
-        WHERE player_no IS NOT NULL AND rank IS NOT NULL
-          AND start_course BETWEEN 1 AND 6
-          AND CAST(start_timing AS REAL) BETWEEN -0.5 AND 1.0
-        GROUP BY player_no, start_course
-    """).fetchall()
-    for row in pc_rows:
-        n = row[2]
-        if n < 5:
-            continue
-        _player_course_hist[(row[0], row[1])] = {
-            "win_rate":   row[3] / n,
-            "top3_rate":  row[4] / n,
-            "avg_st":     float(row[5] or 0.18),
-            "race_count": n,
-        }
+        # ── 選手×会場別実績 ──
+        pv_rows = conn.execute("""
+            SELECT rre.player_no, r.venue_code, COUNT(*) as n,
+                   SUM(CASE WHEN rre.rank=1 THEN 1.0 ELSE 0 END) as wins,
+                   SUM(CASE WHEN rre.rank<=3 THEN 1.0 ELSE 0 END) as top3
+            FROM race_result_entries rre
+            JOIN races r ON r.id = rre.race_id
+            WHERE rre.player_no IS NOT NULL AND rre.rank IS NOT NULL
+            GROUP BY rre.player_no, r.venue_code
+        """).fetchall()
+        for row in pv_rows:
+            n = row[2]
+            if n < 5:
+                continue
+            _player_venue_hist[(row[0], row[1])] = {
+                "win_rate":   row[3] / n,
+                "top3_rate":  row[4] / n,
+                "race_count": n,
+            }
 
-    # ── 決まり手分布 ──
-    tk_rows = conn.execute("""
-        SELECT player_no,
-               SUM(CASE WHEN rank=1 THEN 1.0 ELSE 0 END) as total_wins,
-               SUM(CASE WHEN winning_trick='逃げ'      AND rank=1 THEN 1.0 ELSE 0 END),
-               SUM(CASE WHEN winning_trick='まくり'    AND rank=1 THEN 1.0 ELSE 0 END),
-               SUM(CASE WHEN winning_trick='差し'      AND rank=1 THEN 1.0 ELSE 0 END),
-               SUM(CASE WHEN winning_trick='まくり差し' AND rank=1 THEN 1.0 ELSE 0 END)
-        FROM race_result_entries
-        WHERE player_no IS NOT NULL AND winning_trick IS NOT NULL
-        GROUP BY player_no
-        HAVING total_wins >= 3
-    """).fetchall()
-    for row in tk_rows:
-        total = row[1] or 1
-        _trick_hist[row[0]] = {
-            "pct_nige":        row[2] / total,
-            "pct_makuri":      row[3] / total,
-            "pct_sashi":       row[4] / total,
-            "pct_makurisashi": row[5] / total,
-        }
+        # ── 選手×コース別実績 ──
+        pc_rows = conn.execute("""
+            SELECT player_no, start_course, COUNT(*) as n,
+                   SUM(CASE WHEN rank=1 THEN 1.0 ELSE 0 END) as wins,
+                   SUM(CASE WHEN rank<=3 THEN 1.0 ELSE 0 END) as top3,
+                   AVG(CAST(start_timing AS REAL)) as avg_st
+            FROM race_result_entries
+            WHERE player_no IS NOT NULL AND rank IS NOT NULL
+              AND start_course BETWEEN 1 AND 6
+              AND CAST(start_timing AS REAL) BETWEEN -0.5 AND 1.0
+            GROUP BY player_no, start_course
+        """).fetchall()
+        for row in pc_rows:
+            n = row[2]
+            if n < 5:
+                continue
+            _player_course_hist[(row[0], row[1])] = {
+                "win_rate":   row[3] / n,
+                "top3_rate":  row[4] / n,
+                "avg_st":     float(row[5] or 0.18),
+                "race_count": n,
+            }
+
+        # ── 決まり手分布 ──
+        tk_rows = conn.execute("""
+            SELECT player_no,
+                   SUM(CASE WHEN rank=1 THEN 1.0 ELSE 0 END) as total_wins,
+                   SUM(CASE WHEN winning_trick='逃げ'      AND rank=1 THEN 1.0 ELSE 0 END),
+                   SUM(CASE WHEN winning_trick='まくり'    AND rank=1 THEN 1.0 ELSE 0 END),
+                   SUM(CASE WHEN winning_trick='差し'      AND rank=1 THEN 1.0 ELSE 0 END),
+                   SUM(CASE WHEN winning_trick='まくり差し' AND rank=1 THEN 1.0 ELSE 0 END)
+            FROM race_result_entries
+            WHERE player_no IS NOT NULL AND winning_trick IS NOT NULL
+            GROUP BY player_no
+            HAVING total_wins >= 3
+        """).fetchall()
+        for row in tk_rows:
+            total = row[1] or 1
+            _trick_hist[row[0]] = {
+                "pct_nige":        row[2] / total,
+                "pct_makuri":      row[3] / total,
+                "pct_sashi":       row[4] / total,
+                "pct_makurisashi": row[5] / total,
+            }
+
+        _save_stats_cache()
 
     conn.close()
     _cache_ready = True

@@ -1862,7 +1862,7 @@ def get_payout_summary(date):
     return {vc: venues[vc] for vc in venue_order if vc in venues}
 
 
-@st.cache_data(ttl=15)
+@st.cache_data(ttl=60)
 def get_deadline_races(date):
     """締切順レース一覧（結果未確定のもの）"""
     with _conn() as c:
@@ -3862,7 +3862,8 @@ def _get_history_venue_summary(sel_date: str):
                    COUNT(*) as race_count,
                    SUM(CASE WHEN rre.race_id IS NOT NULL THEN 1 ELSE 0 END) as result_count
             FROM races r
-            LEFT JOIN (SELECT DISTINCT race_id FROM race_result_entries) rre ON r.id = rre.race_id
+            LEFT JOIN race_result_entries rre
+                   ON rre.race_id = r.id AND rre.rank = 1
             WHERE r.date=?
             GROUP BY r.venue_code
             ORDER BY r.venue_code
@@ -4945,18 +4946,32 @@ def show_ml_recommend():
     from db_connect import open_db as _open_db
     conn = _open_db()
 
-    rows = conn.execute("""
-        SELECT r.venue_code, r.race_no, r.id, r.scheduled_time, r.race_title,
-               (SELECT r1.boat_no || '-' || r2.boat_no || '-' || r3.boat_no
-                FROM race_result_entries r1
-                JOIN race_result_entries r2 ON r2.race_id = r1.race_id AND r2.rank = 2
-                JOIN race_result_entries r3 ON r3.race_id = r1.race_id AND r3.rank = 3
-                WHERE r1.race_id = r.id AND r1.rank = 1) AS result_combo
+    # ── レース一覧取得（相関サブクエリなし）──
+    race_rows = conn.execute("""
+        SELECT r.venue_code, r.race_no, r.id, r.scheduled_time, r.race_title
         FROM races r
         WHERE r.date = ?
           AND EXISTS (SELECT 1 FROM entries e WHERE e.race_id = r.id)
         ORDER BY r.scheduled_time, r.venue_code, r.race_no
     """, (date,)).fetchall()
+
+    # ── 結果組み合わせを1クエリで一括取得（毎レース個別の3重JOIN → 1回のバッチJOIN）──
+    result_combos: dict = {}
+    _race_ids = [r[2] for r in race_rows]
+    if _race_ids:
+        _ph = ",".join("?" * len(_race_ids))
+        for _cr in conn.execute(f"""
+            SELECT b1.race_id,
+                   b1.boat_no || '-' || b2.boat_no || '-' || b3.boat_no AS combo
+            FROM race_result_entries b1
+            JOIN race_result_entries b2 ON b2.race_id = b1.race_id AND b2.rank = 2
+            JOIN race_result_entries b3 ON b3.race_id = b1.race_id AND b3.rank = 3
+            WHERE b1.rank = 1 AND b1.race_id IN ({_ph})
+        """, _race_ids).fetchall():
+            result_combos[_cr[0]] = _cr[1]
+
+    # 元のカラム順 (venue_code, race_no, id, scheduled_time, race_title, result_combo) に戻す
+    rows = [(r[0], r[1], r[2], r[3], r[4], result_combos.get(r[2])) for r in race_rows]
     conn.close()
 
     if not rows:

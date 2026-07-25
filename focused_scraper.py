@@ -251,6 +251,14 @@ def save_race_data(conn: sqlite3.Connection, data: dict) -> bool:
 
 
 def main() -> None:
+    # ── レース開催時間外は即終了（Turso read 節約）──
+    # 7:30 未満 / 23:30 超はどの会場もレースなし → DB呼び出し不要
+    _now_h = datetime.now()
+    if not (7 <= _now_h.hour < 23 or (_now_h.hour == 23 and _now_h.minute <= 30)):
+        return
+    if _now_h.hour < 7 or (_now_h.hour == 7 and _now_h.minute < 30):
+        return
+
     # ── DB書き込みロック取得（today_scraper等と同時書き込み防止） ──
     # today_scraperがフェッチ中（最大5分）でも待機して衝突を防ぐ
     from db_lock import acquire_write_lock, release_write_lock
