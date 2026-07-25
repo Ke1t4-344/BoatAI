@@ -1968,13 +1968,10 @@ def show_home():
             st.caption(f"最終確認: {now_time}　🟠直前5分以内  🔴締切済")
 
         # 推奨買い目マップ (venue_code, race_no) -> {"honmei": combo, ...}
-        with _conn() as _dc:
-            _recs_raw = _dc.execute(
-                "SELECT venue_code, race_no, category, combo FROM daily_recommendations WHERE date=?",
-                (date,)
-            ).fetchall()
+        # _get_recs() は TTL=300s キャッシュ済み — 追加 Turso 読み込み不要
+        _recs_cached, _, _ = _get_recs(date)
         _dl_rec_map = {}
-        for _rr in _recs_raw:
+        for _rr in _recs_cached:
             _dl_rec_map.setdefault((_rr["venue_code"], _rr["race_no"]), {})[_rr["category"]] = _rr["combo"]
 
         if not dl_races:
@@ -2255,6 +2252,182 @@ def show_overview():
             st.divider()
 
 
+# ─── Page: Race detail — cached helpers ──────────────────────────────────────
+
+@st.cache_data(ttl=120)
+def _get_race_stime(date: str, vc: str, race_no: int) -> str:
+    """scheduled_time 1行取得（120秒キャッシュ）"""
+    with _conn() as c:
+        row = c.execute(
+            "SELECT scheduled_time FROM races WHERE date=? AND venue_code=? AND race_no=?",
+            (date, vc, race_no)
+        ).fetchone()
+    return (row[0] if row and row[0] else "")
+
+
+@st.cache_data(ttl=60)
+def _get_race_id_and_anomalies(date: str, vc: str, race_no: int, min_gap: float = 3.0):
+    """race_id + オッズ歪み検出（60秒キャッシュ）"""
+    with _conn() as c:
+        row = c.execute(
+            "SELECT id FROM races WHERE date=? AND venue_code=? AND race_no=?",
+            (date, vc, race_no)
+        ).fetchone()
+        if not row:
+            return None, []
+        rid = int(row[0])
+        try:
+            anomalies = _analysis.get_odds_anomalies(c, rid, min_gap=min_gap)
+        except Exception:
+            anomalies = []
+    return rid, anomalies
+
+
+@st.cache_data(ttl=120)
+def _get_entry_and_before_info(date: str, vc: str, race_no: int):
+    """entries + before_info を一括取得（120秒キャッシュ）"""
+    with _conn() as c:
+        entry_rows = c.execute("""
+            SELECT boat_no, player_no, player_class, age,
+                   flying_count, late_count, avg_start_timing,
+                   national_win_rate, national_2ring_rate,
+                   local_win_rate, local_2ring_rate,
+                   motor_no, motor_2ring_rate, boat_no_hull, boat_2ring_rate
+            FROM entries WHERE race_id=(
+                SELECT id FROM races WHERE date=? AND venue_code=? AND race_no=?
+            ) ORDER BY boat_no
+        """, (date, vc, race_no)).fetchall()
+        bi_rows = c.execute("""
+            SELECT b.boat_no, b.exhibition_time, b.tilt,
+                   b.exhibit_course, b.exhibit_st,
+                   b.prev_race_venue, b.prev_race_date, b.prev_entry_course,
+                   b.prev_start_timing, b.prev_finish,
+                   b.lap_time, b.mawariashi_time, b.straight_time
+            FROM before_info b
+            WHERE b.id IN (
+                SELECT MAX(id) FROM before_info
+                WHERE race_id=(
+                    SELECT id FROM races WHERE date=? AND venue_code=? AND race_no=?
+                )
+                GROUP BY boat_no
+            )
+            ORDER BY b.boat_no
+        """, (date, vc, race_no)).fetchall()
+    return (
+        {r["boat_no"]: dict(r) for r in entry_rows},
+        {r["boat_no"]: dict(r) for r in bi_rows},
+    )
+
+
+@st.cache_data(ttl=120)
+def _get_course_stats_batch(player_course_pairs: tuple):
+    """course_stats を複数 (player_no, course_no) ペアで一括取得（120秒キャッシュ）"""
+    if not player_course_pairs:
+        return {}
+    where_cs = " OR ".join(["(player_no=? AND course_no=?)"] * len(player_course_pairs))
+    params_cs = [x for pair in player_course_pairs for x in pair]
+    cs_latest: dict = {}
+    with _conn() as c:
+        for r in c.execute(
+            f"SELECT player_no, course_no, win_rate_1st, win_rate_2nd, win_rate_3rd,"
+            f" entry_rate, avg_st, fetched_date FROM course_stats WHERE {where_cs}",
+            params_cs
+        ).fetchall():
+            key = (r["player_no"], r["course_no"])
+            if key not in cs_latest or (r["fetched_date"] or "") > (cs_latest[key]["fetched_date"] or ""):
+                cs_latest[key] = dict(r)
+    return cs_latest
+
+
+@st.cache_data(ttl=3600)
+def _get_trick_stats_raw(player_nos: tuple) -> list:
+    """選手の全出走履歴（決まり手・着順）を一括取得（1時間キャッシュ）"""
+    if not player_nos:
+        return []
+    pno_ph = ",".join(["?"] * len(player_nos))
+    with _conn() as c:
+        rows = c.execute(f"""
+            SELECT me.player_no, me.boat_no, me.rank, me.winning_trick,
+                   w.winning_trick AS winner_trick, w.start_course AS winner_course
+            FROM race_result_entries me
+            JOIN race_result_entries w ON w.race_id = me.race_id AND w.rank = 1
+            WHERE me.player_no IN ({pno_ph})
+        """, player_nos).fetchall()
+    return [dict(r) for r in rows]
+
+
+@st.cache_data(ttl=1800)
+def _get_meet_start(vc: str, date: str) -> str:
+    """今節開始日を計算（30分キャッシュ）"""
+    with _conn() as c:
+        past_dates = [r[0] for r in c.execute(
+            "SELECT DISTINCT date FROM races WHERE venue_code=? AND date<=? ORDER BY date DESC",
+            (vc, date)
+        ).fetchall()]
+    meet_start = past_dates[0] if past_dates else date
+    for i in range(1, len(past_dates)):
+        try:
+            _d0 = datetime.strptime(past_dates[i - 1], "%Y%m%d")
+            _d1 = datetime.strptime(past_dates[i], "%Y%m%d")
+            if (_d0 - _d1).days == 1:
+                meet_start = past_dates[i]
+            else:
+                break
+        except Exception:
+            break
+    return meet_start
+
+
+@st.cache_data(ttl=120)
+def _get_player_history(player_nos: tuple, vc: str, date: str, meet_start: str):
+    """今節成績 + 過去10走 + 3連単を一括取得（120秒キャッシュ）"""
+    if not player_nos:
+        return [], [], {}
+    _ph = ",".join("?" * len(player_nos))
+    with _conn() as c:
+        ks_rows = c.execute(f"""
+            SELECT rre.player_no, r.date, r.race_no, rre.boat_no, rre.rank, rre.start_timing
+            FROM race_result_entries rre
+            JOIN races r ON r.id=rre.race_id
+            WHERE rre.player_no IN ({_ph})
+              AND r.venue_code=?
+              AND r.date BETWEEN ? AND ?
+              AND rre.rank IS NOT NULL
+            ORDER BY rre.player_no, r.date, r.race_no
+        """, (*player_nos, vc, meet_start, date)).fetchall()
+
+        all_hist_rows = c.execute(f"""
+            SELECT rre.player_no, r.id AS race_id, r.date, r.venue_code, r.race_no,
+                   rre.boat_no, rre.rank, rre.start_timing
+            FROM race_result_entries rre
+            JOIN races r ON r.id = rre.race_id
+            WHERE rre.player_no IN ({_ph})
+              AND rre.rank IS NOT NULL
+            ORDER BY rre.player_no, r.date DESC, r.race_no DESC
+            LIMIT 600
+        """, player_nos).fetchall()
+
+        hist_race_ids = list({r["race_id"] for r in all_hist_rows})
+        combo_map: dict = {}
+        if hist_race_ids:
+            _rid_ph = ",".join("?" * len(hist_race_ids))
+            for cr in c.execute(f"""
+                SELECT b1.race_id,
+                       b1.boat_no || '-' || b2.boat_no || '-' || b3.boat_no AS combo3t
+                FROM race_result_entries b1
+                JOIN race_result_entries b2 ON b2.race_id=b1.race_id AND b2.rank=2
+                JOIN race_result_entries b3 ON b3.race_id=b1.race_id AND b3.rank=3
+                WHERE b1.race_id IN ({_rid_ph}) AND b1.rank=1
+            """, hist_race_ids).fetchall():
+                combo_map[cr["race_id"]] = cr["combo3t"]
+
+    return (
+        [dict(r) for r in ks_rows],
+        [dict(r) for r in all_hist_rows],
+        combo_map,
+    )
+
+
 # ─── Page: Race detail ────────────────────────────────────────────────────────
 def show_detail():
     date    = latest_date()
@@ -2292,12 +2465,7 @@ def show_detail():
     rec_det  = pred.get("recommended_3t_detail", [])
     ev_det   = pred.get("ev_recs_detail", [])
 
-    with _conn() as _c:
-        _stime_row = _c.execute(
-            "SELECT scheduled_time FROM races WHERE date=? AND venue_code=? AND race_no=?",
-            (date, vc, race_no)
-        ).fetchone()
-    _stime = _stime_row[0] if _stime_row and _stime_row[0] else ""
+    _stime = _get_race_stime(date, vc, race_no)
     _stime_str = f"　🕐{_stime}" if _stime else ""
     st.caption(f"{ri['race_title'] or ''}{_stime_str}")
 
@@ -2485,21 +2653,9 @@ def show_detail():
         st.subheader("🔍 オッズ歪み検出")
         st.caption("モデルが高く評価しているのに市場オッズが高い（＝市場が過小評価している）買い目を検出します。")
 
-        with _conn() as _c_ev:
-            _race_id_ev = _c_ev.execute(
-                "SELECT id FROM races WHERE date=? AND venue_code=? AND race_no=?",
-                (date, vc, race_no)
-            ).fetchone()
+        _rid_ev, anomalies = _get_race_id_and_anomalies(date, vc, race_no, min_gap=3.0)
 
-        if _race_id_ev:
-            _rid_ev = _race_id_ev[0]
-
-            try:
-                with _conn() as c:
-                    anomalies = _analysis.get_odds_anomalies(c, _rid_ev, min_gap=3.0)
-            except Exception:
-                anomalies = []
-
+        if _rid_ev:
             if not anomalies:
                 st.info("predictionsデータがないか、歪みが検出されませんでした。（backtestデータ蓄積後に有効になります）")
             else:
@@ -2530,58 +2686,30 @@ def show_detail():
     # ── タブ3: 出走表・直前情報 ───────────────────────────────────────────────
     with tab_entry:
         with st.spinner("データ読み込み中..."):
-          with _conn() as conn2:
-            entry_details = {r["boat_no"]: dict(r) for r in conn2.execute("""
-                SELECT boat_no, player_no, player_class, age,
-                       flying_count, late_count, avg_start_timing,
-                       national_win_rate, national_2ring_rate,
-                       local_win_rate, local_2ring_rate,
-                       motor_no, motor_2ring_rate, boat_no_hull, boat_2ring_rate
-                FROM entries WHERE race_id=(
-                    SELECT id FROM races WHERE date=? AND venue_code=? AND race_no=?
-                ) ORDER BY boat_no
-            """, (date, vc, race_no)).fetchall()}
+            # entries + before_info をキャッシュ関数で取得
+            entry_details, prev_info = _get_entry_and_before_info(date, vc, race_no)
 
             boats_for_cs = {b["boat_no"]: (b["components"].get("player_no") or
                             entry_details.get(b["boat_no"], {}).get("player_no"), b["start_course"])
                             for b in boats}
 
             # ── course_stats: 全選手分を1クエリで取得 ──────────────────────
-            pno_cs_pairs = [(pno, cs) for bn, (pno, cs) in boats_for_cs.items() if pno and cs is not None]
+            pno_cs_pairs = tuple((pno, cs) for bn, (pno, cs) in boats_for_cs.items() if pno and cs is not None)
+            cs_latest = _get_course_stats_batch(pno_cs_pairs)
             cs_rows = {}
-            if pno_cs_pairs:
-                where_cs = " OR ".join(["(player_no=? AND course_no=?)"] * len(pno_cs_pairs))
-                params_cs = [x for pair in pno_cs_pairs for x in pair]
-                cs_latest: dict = {}
-                for r in conn2.execute(
-                    f"SELECT player_no, course_no, win_rate_1st, win_rate_2nd, win_rate_3rd,"
-                    f" entry_rate, avg_st, fetched_date FROM course_stats WHERE {where_cs}",
-                    params_cs
-                ).fetchall():
-                    key = (r["player_no"], r["course_no"])
-                    if key not in cs_latest or (r["fetched_date"] or "") > (cs_latest[key]["fetched_date"] or ""):
-                        cs_latest[key] = dict(r)
-                for bn, (pno, cs) in boats_for_cs.items():
-                    cs_rows[bn] = cs_latest.get((pno, cs), {})
+            for bn, (pno, cs) in boats_for_cs.items():
+                cs_rows[bn] = cs_latest.get((pno, cs), {})
 
             # ── race_result_entries: 全選手分を1クエリで取得してPython集計 ──
-            # 6艇×4クエリ(24 HTTP)→ 1クエリに削減
             from collections import Counter as _Counter
+            from collections import defaultdict as _dd
             lose_data:    dict = {}
             trick_detail: dict = {}
             all_pnos = [pno for pno, _ in boats_for_cs.values() if pno]
             if all_pnos:
-                pno_ph = ",".join(["?"] * len(all_pnos))
-                rre_raw = conn2.execute(f"""
-                    SELECT me.player_no, me.boat_no, me.rank, me.winning_trick,
-                           w.winning_trick AS winner_trick, w.start_course AS winner_course
-                    FROM race_result_entries me
-                    JOIN race_result_entries w ON w.race_id = me.race_id AND w.rank = 1
-                    WHERE me.player_no IN ({pno_ph})
-                """, all_pnos).fetchall()
+                # キャリア統計（1時間キャッシュ — 決まり手・着順は当日大きく変化しない）
+                rre_raw = _get_trick_stats_raw(tuple(all_pnos))
 
-                # player_no → 行リスト
-                from collections import defaultdict as _dd
                 player_rows: dict = _dd(list)
                 for r in rre_raw:
                     player_rows[r["player_no"]].append(r)
@@ -2591,7 +2719,6 @@ def show_detail():
                         continue
                     rows_p = player_rows.get(pno, [])
 
-                    # lose_data
                     loses_p = [r for r in rows_p if r["rank"] != 1]
                     total_ld = len(loses_p)
                     if total_ld > 0:
@@ -2604,7 +2731,6 @@ def show_detail():
                             "makuri_sashi_lose": round(tm.get("まくり差し", 0) / total_ld * 100, 1),
                         }
 
-                    # trick_detail
                     wins_all_p  = [r for r in rows_p if r["rank"] == 1]
                     rows_bn     = [r for r in rows_p if r["boat_no"] == bn]
                     wins_bn     = [r for r in rows_bn if r["rank"] == 1]
@@ -2623,24 +2749,6 @@ def show_detail():
                         "lose_boat":        [(sc, wt, cnt) for (sc, wt), cnt in lb_top],
                         "total_loses_boat": len(loses_bn),
                     }
-
-            # ── before_info: 1クエリ ─────────────────────────────────────
-            prev_info = {r["boat_no"]: dict(r) for r in conn2.execute("""
-                SELECT b.boat_no, b.exhibition_time, b.tilt,
-                       b.exhibit_course, b.exhibit_st,
-                       b.prev_race_venue, b.prev_race_date, b.prev_entry_course,
-                       b.prev_start_timing, b.prev_finish,
-                       b.lap_time, b.mawariashi_time, b.straight_time
-                FROM before_info b
-                WHERE b.id IN (
-                    SELECT MAX(id) FROM before_info
-                    WHERE race_id=(
-                        SELECT id FROM races WHERE date=? AND venue_code=? AND race_no=?
-                    )
-                    GROUP BY boat_no
-                )
-                ORDER BY b.boat_no
-            """, (date, vc, race_no)).fetchall()}
 
         sub1, sub2, sub3, sub4, sub5, sub6 = st.tabs(["📋 出走表（フル）", "🎯 枠別成績", "🔄 前走・直前情報", "⚙️ モーター情報", "👥 選手相性", "🎯 出目パターン"])
 
@@ -2703,97 +2811,38 @@ def show_detail():
             # ── 今節成績 / 過去10走 ─────────────────────────────────────────
             st.markdown("---")
 
-            # player_noをDBから直接取得（predictキャッシュに依存しない）
-            with _conn() as _pno_conn:
-                _direct_pno_rows = _pno_conn.execute("""
-                    SELECT e.boat_no, e.player_no FROM entries e
-                    JOIN races r ON r.id=e.race_id
-                    WHERE r.date=? AND r.venue_code=? AND r.race_no=?
-                    ORDER BY e.boat_no
-                """, (date, vc, race_no)).fetchall()
-            _boat_pno = {r["boat_no"]: r["player_no"] for r in _direct_pno_rows}
+            # player_noはentry_detailsから取得（DB追加読み込み不要）
+            _boat_pno = {bn: ed.get("player_no") for bn, ed in entry_details.items()}
             _player_nos = [p for p in _boat_pno.values() if p]
 
             if _player_nos:
-                # 今節開始日を計算（連続する日付を遡る）
-                with _conn() as _ms_conn:
-                    _past_dates = [r[0] for r in _ms_conn.execute(
-                        "SELECT DISTINCT date FROM races WHERE venue_code=? AND date<=? ORDER BY date DESC",
-                        (vc, date)
-                    ).fetchall()]
-                _meet_start = _past_dates[0] if _past_dates else date
-                for _i in range(1, len(_past_dates)):
-                    try:
-                        _d0 = datetime.strptime(_past_dates[_i - 1], "%Y%m%d")
-                        _d1 = datetime.strptime(_past_dates[_i], "%Y%m%d")
-                        if (_d0 - _d1).days == 1:
-                            _meet_start = _past_dates[_i]
-                        else:
-                            break
-                    except Exception:
-                        break
+                # 今節開始日（キャッシュ済み）
+                _meet_start = _get_meet_start(vc, date)
 
-                _ph = ",".join("?" * len(_player_nos))
-                with _conn() as _dc:
-                    # 今節成績（節開始日〜当日, rre.player_no 直接参照）
-                    _ks_rows = _dc.execute(f"""
-                        SELECT rre.player_no, r.date, r.race_no, rre.boat_no, rre.rank, rre.start_timing
-                        FROM race_result_entries rre
-                        JOIN races r ON r.id=rre.race_id
-                        WHERE rre.player_no IN ({_ph})
-                          AND r.venue_code=?
-                          AND r.date BETWEEN ? AND ?
-                          AND rre.rank IS NOT NULL
-                        ORDER BY rre.player_no, r.date, r.race_no
-                    """, (*_player_nos, vc, _meet_start, date)).fetchall()
+                # 今節成績 + 過去10走 + 3連単（キャッシュ済み）
+                _ks_rows_raw, _all_hist_rows, _combo_map = _get_player_history(
+                    tuple(_player_nos), vc, date, _meet_start
+                )
 
-                    # 過去10走: 全選手まとめて1クエリ（correlated subquery排除）
-                    _pno_ph2 = ",".join("?" * len(_player_nos))
-                    _all_hist_rows = _dc.execute(f"""
-                        SELECT rre.player_no, r.id AS race_id, r.date, r.venue_code, r.race_no,
-                               rre.boat_no, rre.rank, rre.start_timing
-                        FROM race_result_entries rre
-                        JOIN races r ON r.id = rre.race_id
-                        WHERE rre.player_no IN ({_pno_ph2})
-                          AND rre.rank IS NOT NULL
-                        ORDER BY rre.player_no, r.date DESC, r.race_no DESC
-                        LIMIT 600
-                    """, _player_nos).fetchall()
+                # Python側で艇番ごとに上位10件を抽出
+                from collections import defaultdict as _dd2
+                _hist_by_key: dict = _dd2(list)
+                for _hr in _all_hist_rows:
+                    _key = (_hr["player_no"], _hr["boat_no"])
+                    if len(_hist_by_key[_key]) < 10:
+                        _hist_by_key[_key].append(
+                            dict(_hr) | {"combo3t": _combo_map.get(_hr["race_id"])}
+                        )
 
-                    # 各レースの3連単を別途1クエリで取得
-                    _hist_race_ids = list({r["race_id"] for r in _all_hist_rows})
-                    _combo_map: dict = {}
-                    if _hist_race_ids:
-                        _rid_ph = ",".join("?" * len(_hist_race_ids))
-                        for _cr in _dc.execute(f"""
-                            SELECT b1.race_id,
-                                   b1.boat_no || '-' || b2.boat_no || '-' || b3.boat_no AS combo3t
-                            FROM race_result_entries b1
-                            JOIN race_result_entries b2 ON b2.race_id=b1.race_id AND b2.rank=2
-                            JOIN race_result_entries b3 ON b3.race_id=b1.race_id AND b3.rank=3
-                            WHERE b1.race_id IN ({_rid_ph}) AND b1.rank=1
-                        """, _hist_race_ids).fetchall():
-                            _combo_map[_cr["race_id"]] = _cr["combo3t"]
-
-                    # Python側で艇番ごとに上位10件を抽出
-                    from collections import defaultdict as _dd2
-                    _hist_by_key: dict = _dd2(list)
-                    for _hr in _all_hist_rows:
-                        _key = (_hr["player_no"], _hr["boat_no"])
-                        if len(_hist_by_key[_key]) < 10:
-                            _hist_by_key[_key].append(
-                                dict(_hr) | {"combo3t": _combo_map.get(_hr["race_id"])}
-                            )
-
-                    _hist_map = {}
-                    for _b2 in boats:
-                        _pno2 = _boat_pno.get(_b2["boat_no"])
-                        _bno2 = _b2["boat_no"]
-                        _hist_map[_bno2] = _hist_by_key.get((_pno2, _bno2), []) if _pno2 else []
+                _hist_map = {}
+                for _b2 in boats:
+                    _pno2 = _boat_pno.get(_b2["boat_no"])
+                    _bno2 = _b2["boat_no"]
+                    _hist_map[_bno2] = _hist_by_key.get((_pno2, _bno2), []) if _pno2 else []
 
                 from collections import defaultdict as _dd
                 _ks_map = _dd(list)
-                for _r in _ks_rows:
+                for _r in _ks_rows_raw:
                     _ks_map[_r["player_no"]].append((
                         _r["date"], _r["race_no"], _r["boat_no"], _r["rank"], _r["start_timing"]
                     ))
@@ -3637,6 +3686,15 @@ def show_detail():
 
 
 # ─── Page: Analysis ───────────────────────────────────────────────────────────
+@st.cache_data(ttl=3600)
+def _get_analysis_venue_codes() -> list:
+    """分析ページ用会場コード一覧（1時間キャッシュ）"""
+    with _conn() as c:
+        return [r[0] for r in c.execute(
+            "SELECT DISTINCT venue_code FROM races ORDER BY venue_code"
+        ).fetchall()]
+
+
 def show_analysis():
     _page_header(
         "高度分析",
@@ -3648,11 +3706,9 @@ def show_analysis():
     KIMARI_TE_LIST = ["逃げ", "差し", "まくり", "まくり差し", "抜き", "恵まれ"]
     COURSE_COLORS_A = COURSE_COLORS  # 艇番カラーと統一
 
-    with _conn() as conn_a:
-        _vc_rows = conn_a.execute(
-            "SELECT DISTINCT venue_code FROM races ORDER BY venue_code"
-        ).fetchall()
-        venues_df = pd.DataFrame([{"venue_code": r[0]} for r in _vc_rows])
+    # 会場コード一覧（1時間キャッシュ済み — 全レンダリングで再クエリしない）
+    _vc_codes = _get_analysis_venue_codes()
+    venues_df = pd.DataFrame([{"venue_code": c} for c in _vc_codes])
     venue_opts = ["全会場"] + [
         f"{c} {_analysis.venue_name(c)}" for c in venues_df["venue_code"]
     ]
@@ -3881,6 +3937,48 @@ def _get_history_venue_summary(sel_date: str):
     return [dict(r) for r in rows]
 
 
+@st.cache_data(ttl=120)
+def _get_history_detail(date: str, vc: str):
+    """履歴ページ詳細データ一括取得（120秒キャッシュ）"""
+    with _conn() as c:
+        races = c.execute(
+            "SELECT id, race_no, race_title FROM races WHERE date=? AND venue_code=? ORDER BY race_no",
+            (date, vc)).fetchall()
+        all_results_raw = []
+        all_payouts_raw = []
+        all_preds_raw   = []
+        if races:
+            all_results_raw = c.execute(
+                "SELECT rre.race_id, rre.rank, rre.boat_no, rre.player_name, rre.start_timing "
+                "FROM races r "
+                "JOIN race_result_entries rre ON rre.race_id = r.id "
+                "WHERE r.date=? AND r.venue_code=? ORDER BY rre.race_id, rre.rank",
+                (date, vc)
+            ).fetchall()
+            all_payouts_raw = c.execute(
+                "SELECT p.race_id, p.bet_type, p.combination, p.payout, p.popularity "
+                "FROM payouts p JOIN races r ON r.id = p.race_id "
+                "WHERE r.date=? AND r.venue_code=? "
+                "ORDER BY p.race_id, CASE p.bet_type "
+                "WHEN '3連単' THEN 1 WHEN '3連複' THEN 2 WHEN '2連単' THEN 3 "
+                "WHEN '2連複' THEN 4 ELSE 5 END, p.popularity",
+                (date, vc)
+            ).fetchall()
+            all_preds_raw = c.execute(
+                "SELECT p.race_id, p.top5_combos, p.actual_combo, p.hit_top3, p.hit_top5, "
+                "p.top5_honmei, p.top5_chuana, p.top5_ana "
+                "FROM predictions p JOIN races r ON r.id = p.race_id "
+                "WHERE r.date=? AND r.venue_code=?",
+                (date, vc)
+            ).fetchall()
+    return (
+        [dict(r) for r in races],
+        [dict(r) for r in all_results_raw],
+        [dict(r) for r in all_payouts_raw],
+        [dict(r) for r in all_preds_raw],
+    )
+
+
 def show_history():
     _page_header(
         "過去レース結果",
@@ -3951,50 +4049,19 @@ def show_history():
     st.divider()
     st.subheader(f"🏟 {vn}　{sel_date[:4]}/{sel_date[4:6]}/{sel_date[6:8]}")
 
-    with _conn() as c:
-        races = c.execute(
-            "SELECT id, race_no, race_title FROM races WHERE date=? AND venue_code=? ORDER BY race_no",
-            (sel_date, sel_vc)).fetchall()
-
-        # 全レースのデータを1コネクション・3クエリで一括取得（N×1コネクションを廃止）
-        race_ids = [r["id"] for r in races]
-        all_results_raw = []
-        all_payouts_raw = []
-        all_preds_raw = []
-        if race_ids:
-            all_results_raw = c.execute(
-                "SELECT rre.race_id, rre.rank, rre.boat_no, rre.player_name, rre.start_timing "
-                "FROM races r "
-                "JOIN race_result_entries rre ON rre.race_id = r.id "
-                "WHERE r.date=? AND r.venue_code=? ORDER BY rre.race_id, rre.rank",
-                (sel_date, sel_vc)
-            ).fetchall()
-            all_payouts_raw = c.execute(
-                "SELECT p.race_id, p.bet_type, p.combination, p.payout, p.popularity "
-                "FROM payouts p JOIN races r ON r.id = p.race_id "
-                "WHERE r.date=? AND r.venue_code=? "
-                "ORDER BY p.race_id, CASE p.bet_type "
-                "WHEN '3連単' THEN 1 WHEN '3連複' THEN 2 WHEN '2連単' THEN 3 "
-                "WHEN '2連複' THEN 4 ELSE 5 END, p.popularity",
-                (sel_date, sel_vc)
-            ).fetchall()
-            all_preds_raw = c.execute(
-                "SELECT p.race_id, p.top5_combos, p.actual_combo, p.hit_top3, p.hit_top5, "
-                "p.top5_honmei, p.top5_chuana, p.top5_ana "
-                "FROM predictions p JOIN races r ON r.id = p.race_id "
-                "WHERE r.date=? AND r.venue_code=?",
-                (sel_date, sel_vc)
-            ).fetchall()
+    # 全データを1キャッシュ関数で取得（venue選択時の都度Turso読み込みを排除）
+    races_raw, all_results_raw, all_payouts_raw, all_preds_raw = _get_history_detail(sel_date, sel_vc)
+    races = races_raw  # list[dict]
 
     # race_id → データ辞書に変換（Python側でグループ化）
     from collections import defaultdict
     _results_by_race: dict = defaultdict(list)
     for r in all_results_raw:
-        _results_by_race[r[0]].append(r)
+        _results_by_race[r["race_id"]].append(r)
     _payouts_by_race: dict = defaultdict(list)
     for r in all_payouts_raw:
-        _payouts_by_race[r[0]].append(r)
-    _preds_by_race: dict = {r[0]: r for r in all_preds_raw}
+        _payouts_by_race[r["race_id"]].append(r)
+    _preds_by_race: dict = {r["race_id"]: r for r in all_preds_raw}
 
     for race in races:
         race_id = race["id"]
